@@ -1,4 +1,4 @@
-module github.com/artem-russkikh/wireproxy-awg
+module github.com/ageich/wireproxy-awg
 
 go 1.26
 
