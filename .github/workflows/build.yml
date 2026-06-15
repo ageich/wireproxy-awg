@@ -1,35 +1,35 @@
-name: Build wireproxy-awg
+name: Build
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [linux, windows, darwin]
-        arch: [amd64, arm64]
-
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-          check-latest: true
+          go-version: '1.26'   # изменено на 1.26
 
       - name: Build
         env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -v -o wireproxy-awg-${{ matrix.os }}-${{ matrix.arch }} ./cmd/wireproxy
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wireproxy-awg-${{ matrix.os }}-${{ matrix.arch }}
-          path: wireproxy-awg-${{ matrix.os }}-${{ matrix.arch }}
+        run: |
+          BINARY_NAME="wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then BINARY_NAME="$BINARY_NAME.exe"; fi
+          go build -trimpath -ldflags "-s -w -X 'main.version=${{ github.sha }}'" -o $BINARY_NAME ./cmd/wireproxy
