@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true   # принудительно проверяет последнюю минорную версию 1.26.x
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then BINARY_NAME="$BINARY_NAME.exe"; fi
+          mkdir -p artifacts
+          go build -trimpath -ldflags "-s -w -X 'main.version=${{ github.sha }}'" -o artifacts/$BINARY_NAME ./cmd/wireproxy
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cd ..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: artifacts/
