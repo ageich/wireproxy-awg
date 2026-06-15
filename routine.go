@@ -235,6 +235,8 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	// Create a DNS resolver with a 5-minute TTL and cleanup every 10 minutes
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, 10*time.Minute)
+	// Сохраняем резолвер в конфиге для возможности остановки его горутины при завершении программы
+	config.resolver = resolver
 
 	var authMethods []socks5.Authenticator
 	if username := config.Username; username != "" {
