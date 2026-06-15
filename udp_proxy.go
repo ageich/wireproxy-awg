@@ -36,6 +36,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	sessions := make(map[string]*udpSession)
 	var sessionMu sync.Mutex
 
+	// Безопасно закрывает канал сессии (игнорирует, если уже закрыт)
 	closeSessionChan := func(sess *udpSession) {
 		select {
 		case <-sess.closeChan:
@@ -44,17 +45,16 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}
 	}
 
+	// Удаляет сессию из map (канал при этом не закрывает — это делает таймаут или handleRemoteToLocal)
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		if current, ok := sessions[src]; ok && current == sess {
-			// Канал будет закрыт в том месте, где сессия действительно завершается (таймаут или handleRemoteToLocal)
-			// Поэтому здесь только удаляем из map.
 			delete(sessions, src)
 		}
 		sessionMu.Unlock()
 	}
 
-	// Periodically clean up expired sessions if inactivity timeout is enabled
+	// Периодически закрываем неактивные сессии (только закрываем канал, не удаляем из map)
 	if conf.InactivityTimeout > 0 {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
@@ -65,8 +65,8 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 				for key, sess := range sessions {
 					if now.Sub(sess.lastActive) >= inactivityDur {
 						log.Printf("UDPProxyTunnel: closing inactive session for %s", key)
-						closeSessionChan(sess) // закрываем канал, сигнализируя handleRemoteToLocal
-						delete(sessions, key)
+						closeSessionChan(sess) // сигнализируем handleRemoteToLocal о завершении
+						// НЕ удаляем из map — это сделает handleRemoteToLocal в своём defer
 					}
 				}
 				sessionMu.Unlock()
@@ -74,18 +74,16 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}()
 	}
 
-	// Create or get a UDP session based on the local source address
+	// Создаёт или возвращает существующую сессию
 	getOrCreateSession := func(srcAddr string) (*udpSession, error) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 
-		// return if session already exists
 		if s, ok := sessions[srcAddr]; ok {
 			s.lastActive = time.Now()
 			return s, nil
 		}
 
-		// Create a new session
 		remoteConn, err := vt.Tnet.Dial("udp", conf.Target)
 		if err != nil {
 			return nil, fmt.Errorf("UDPProxyTunnel: could not Dial(%s): %w", conf.Target, err)
@@ -99,22 +97,22 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}
 		sessions[srcAddr] = s
 
-		// Spin up a goroutine to handle traffic from remote -> local
+		// Запускаем обработчик трафика из удалённой стороны в локальную
 		go conf.handleRemoteToLocal(listener, srcAddr, s, removeSession)
 		return s, nil
 	}
 
-	// Main loop to read from local client and forward to remote
+	// Основной цикл: читаем от локального клиента и шлём в удалённый endpoint
 	go func() {
 		for {
-			buf := make([]byte, 64*1024) // Создаём буфер внутри цикла, чтобы не удерживать память
+			buf := make([]byte, 64*1024)
 			n, src, err := listener.ReadFromUDP(buf)
 			if err != nil {
 				log.Printf("UDPProxyTunnel: error reading from UDP: %v", err)
-				return // Выходим из горутины при ошибке, буфер будет собран GC
+				return
 			}
 
-			srcKey := src.String() // identify session by the local client's IP:port
+			srcKey := src.String()
 			s, err := getOrCreateSession(srcKey)
 			if err != nil {
 				errorLogger.Printf("UDPProxyTunnel: getOrCreateSession failed for %s: %v", srcKey, err)
@@ -130,11 +128,10 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	}()
 }
 
-// handles data from the remote WireGuard side back to the local client
-// this function blocks until the session is closed
+// handleRemoteToLocal читает данные из удалённого соединения и отправляет их обратно локальному клиенту
 func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(listener *net.UDPConn, srcAddr string, s *udpSession, removeSession func(string, *udpSession)) {
 	defer func() {
-		removeSession(srcAddr, s)
+		removeSession(srcAddr, s) // удаляем сессию из map
 		_ = s.remoteConn.Close()
 	}()
 	buf := make([]byte, 64*1024)
@@ -149,8 +146,8 @@ func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(listener *net.UDPConn, src
 		_ = s.remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, err := s.remoteConn.Read(buf)
 		if err != nil {
-			// If a timeout or temporary error, continue to see if the session is closed
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// При таймауте проверяем, не закрыт ли канал
 				select {
 				case <-s.closeChan:
 					return
