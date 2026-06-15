@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'   # изменено на 1.26
+
+      - name: Build ${{ matrix.goos }}_${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then BINARY_NAME="$BINARY_NAME.exe"; fi
+          go build -trimpath -ldflags "-s -w -X 'main.version=${{ github.sha }}'" -o $BINARY_NAME ./cmd/wireproxy
+          
+          ARTIFACT_NAME="wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip ${ARTIFACT_NAME}.zip $BINARY_NAME
+          else
+            tar -czvf ${ARTIFACT_NAME}.tar.gz $BINARY_NAME
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            wireproxy-awg-*.tar.gz
+            wireproxy-awg-*.zip
