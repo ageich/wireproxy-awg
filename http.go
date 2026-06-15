@@ -24,6 +24,20 @@ type HTTPServer struct {
 	authRequired bool
 }
 
+// responseWith создаёт HTTP-ответ с заданным статус-кодом.
+func responseWith(req *http.Request, statusCode int) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+		Request:    req,
+	}
+}
+
 func (s *HTTPServer) authenticate(req *http.Request) (int, error) {
 	if !s.authRequired {
 		return 0, nil
