@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
@@ -130,19 +131,22 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 
-	go func() {
-		defer func() { _ = conn.Close() }()
-		defer func() { _ = peer.Close() }()
+	var wg sync.WaitGroup
+	wg.Add(2)
 
+	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(conn, peer)
 	}()
 
 	go func() {
-		defer func() { _ = conn.Close() }()
-		defer func() { _ = peer.Close() }()
-
+		defer wg.Done()
 		_, _ = io.Copy(peer, conn)
 	}()
+
+	wg.Wait()
+	conn.Close()
+	peer.Close()
 }
 
 // ListenAndServe is used to create a listener and serve on it
