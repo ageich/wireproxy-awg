@@ -64,6 +64,97 @@ type addressPort struct {
 	port    uint16
 }
 
+// ---------- DNS resolver with limited cache (fixes infinite memory growth) ----------
+type cacheEntry struct {
+	ip      net.IP
+	created time.Time
+}
+
+// fixedResolver implements socks5.NameResolver with a cache that respects TTL
+type fixedResolver struct {
+	tnet        *netstack.Net
+	systemDNS   bool
+	cache       sync.Map // map[string]*cacheEntry
+	ttl         time.Duration
+	cleanupFreq time.Duration
+	stopCleanup chan struct{}
+}
+
+// NewFixedResolver creates a new resolver with cache expiration
+func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl, cleanupFreq time.Duration) *fixedResolver {
+	r := &fixedResolver{
+		tnet:        tnet,
+		systemDNS:   systemDNS,
+		ttl:         ttl,
+		cleanupFreq: cleanupFreq,
+		stopCleanup: make(chan struct{}),
+	}
+	go r.cleanupLoop()
+	return r
+}
+
+func (r *fixedResolver) cleanupLoop() {
+	ticker := time.NewTicker(r.cleanupFreq)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.stopCleanup:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			r.cache.Range(func(key, value interface{}) bool {
+				entry := value.(*cacheEntry)
+				if now.Sub(entry.created) >= r.ttl {
+					r.cache.Delete(key)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// Resolve implements socks5.NameResolver
+func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	// Check cache
+	if cached, ok := r.cache.Load(name); ok {
+		entry := cached.(*cacheEntry)
+		if time.Since(entry.created) < r.ttl {
+			return ctx, entry.ip, nil
+		}
+		r.cache.Delete(name)
+	}
+
+	var ip net.IP
+	var err error
+	if r.systemDNS {
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
+		if err != nil || len(ips) == 0 {
+			return ctx, nil, err
+		}
+		ip = ips[0]
+	} else {
+		addrs, err := r.tnet.LookupContextHost(ctx, name)
+		if err != nil || len(addrs) == 0 {
+			return ctx, nil, err
+		}
+		ip = net.ParseIP(addrs[0])
+		if ip == nil {
+			return ctx, nil, errors.New("failed to parse IP")
+		}
+	}
+
+	// Store in cache
+	r.cache.Store(name, &cacheEntry{ip: ip, created: time.Now()})
+	return ctx, ip, nil
+}
+
+// Stop cleanly shuts down the resolver's cleanup goroutine
+func (r *fixedResolver) Stop() {
+	close(r.stopCleanup)
+}
+
+// ---------- End of fixed DNS resolver ----------
+
 // LookupAddr lookups a hostname.
 // DNS traffic may or may not be routed depending on VirtualTun's setting
 func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
@@ -140,8 +231,11 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
-// SpawnRoutine spawns a socks5 server.
+// SpawnRoutine spawns a socks5 server with fixed DNS resolver (no infinite cache)
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
+	// Create a DNS resolver with a 5-minute TTL and cleanup every 10 minutes
+	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, 10*time.Minute)
+
 	var authMethods []socks5.Authenticator
 	if username := config.Username; username != "" {
 		authMethods = append(authMethods, socks5.UserPassAuthenticator{
@@ -153,7 +247,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 
 	options := []socks5.Option{
 		socks5.WithDial(vt.Tnet.DialContext),
-		socks5.WithResolver(vt),
+		socks5.WithResolver(resolver), // use the fixed resolver instead of vt directly
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
 	}
