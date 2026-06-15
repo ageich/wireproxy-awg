@@ -3,13 +3,12 @@ name: Release
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -17,27 +16,65 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          check-latest: true
 
-      - name: Build ${{ matrix.goos }}_${{ matrix.goarch }}
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+      - name: Extract version from main.go
+        id: get_version
         run: |
-          BINARY_NAME="wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then BINARY_NAME="$BINARY_NAME.exe"; fi
-          go build -trimpath -ldflags "-s -w -X 'main.version=${{ github.sha }}'" -o $BINARY_NAME ./cmd/wireproxy
-          mkdir -p artifacts
-          mv $BINARY_NAME artifacts/
+          VERSION=$(grep '^var version = ' cmd/wireproxy/main.go | sed 's/var version = "\(.*\)"/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Could not extract version from main.go"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Create checksums file
+      - name: Build for all platforms
         run: |
-          cd artifacts
+          mkdir -p dist
+          platforms=(
+            "linux/amd64"
+            "linux/arm64"
+            "windows/amd64"
+            "darwin/amd64"
+            "darwin/arm64"
+          )
+          for platform in "${platforms[@]}"; do
+            GOOS=${platform%/*}
+            GOARCH=${platform#*/}
+            BINARY_NAME="wireproxy-awg-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              BINARY_NAME="$BINARY_NAME.exe"
+            fi
+            echo "Building $BINARY_NAME for $GOOS/$GOARCH"
+            GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X 'main.version=${{ steps.get_version.outputs.version }}'" -o dist/$BINARY_NAME ./cmd/wireproxy
+          done
+
+      - name: Create archives and checksums
+        run: |
+          cd dist
+          for file in *; do
+            if [[ "$file" == *.exe ]]; then
+              zip "${file%.exe}.zip" "$file"
+            else
+              tar -czvf "${file}.tar.gz" "$file"
+            fi
+          done
           sha256sum * > SHA256SUMS
+          sha256sum *.tar.gz *.zip >> SHA256SUMS 2>/dev/null || true
           cd ..
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: wireproxy-awg-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: artifacts/
+          tag_name: ${{ steps.get_version.outputs.tag }}
+          name: Release ${{ steps.get_version.outputs.version }}
+          body: |
+            Автоматический релиз версии ${{ steps.get_version.outputs.version }}
+            Сборка выполнена на основе коммита ${{ github.sha }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
