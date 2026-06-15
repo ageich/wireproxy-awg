@@ -1,6 +1,6 @@
 module github.com/artem-russkikh/wireproxy-awg
 
-go 1.26.0
+go 1.23
 
 require (
 	github.com/MakeNowJust/heredoc/v2 v2.0.1
