@@ -7,8 +7,7 @@ import (
     "net"
     "os"
     "strings"
-    "sync"  // <--- добавлен этот импорт
-
+   
     "github.com/go-ini/ini"
     "net/netip"
 )
