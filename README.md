@@ -65,7 +65,7 @@ Arguments:
 # Build instruction
 
 ```bash
-git clone https://github.com/artem-russkikh/wireproxy-awg
+git clone https://github.com/ageich/wireproxy-awg
 cd wireproxy-awg
 make
 ```
