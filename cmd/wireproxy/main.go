@@ -23,9 +23,9 @@ import (
 const daemonProcess = "daemon-process"
 
 // default paths for wireproxy config file
-var default_config_paths = []string {
-    "/etc/wireproxy/wireproxy.conf",
-    os.Getenv("HOME")+"/.config/wireproxy.conf",
+var default_config_paths = []string{
+	"/etc/wireproxy/wireproxy.conf",
+	os.Getenv("HOME") + "/.config/wireproxy.conf",
 }
 
 var version = "1.0.15-dev"
@@ -59,12 +59,12 @@ func executablePath() string {
 
 // check if default config file paths exist
 func configFilePath() (string, bool) {
-    for _, path := range default_config_paths {
-        if _, err := os.Stat(path); err == nil {
-            return path, true
-        }
-    }
-    return "", false
+	for _, path := range default_config_paths {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func lock(stage string) {
@@ -193,12 +193,12 @@ func main() {
 	}
 
 	if *config == "" {
-        if path, config_exist := configFilePath(); config_exist {
-            *config = path
-        } else {
-            fmt.Println("configuration path is required")
-            return
-        }
+		if path, config_exist := configFilePath(); config_exist {
+			*config = path
+		} else {
+			fmt.Println("configuration path is required")
+			return
+		}
 	}
 
 	if !*daemon {
@@ -249,10 +249,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Запускаем все роутины (SOCKS5, HTTP, UDP прокси и т.д.)
 	for _, spawner := range conf.Routines {
 		go spawner.SpawnRoutine(tun)
 	}
 
+	// Запускаем ICMP пинги
 	tun.StartPingIPs()
 
 	if *info != "" {
@@ -264,5 +266,25 @@ func main() {
 		}()
 	}
 
+	// Ожидаем сигнала завершения
 	<-ctx.Done()
+
+	// --- Graceful shutdown: останавливаем все фоновые задачи ---
+	log.Println("Shutting down gracefully...")
+
+	// Останавливаем ICMP пинги
+	tun.StopPingIPs()
+
+	// Останавливаем DNS-резолверы для всех SOCKS5-серверов
+	for _, spawner := range conf.Routines {
+		if s5, ok := spawner.(*wireproxyawg.Socks5Config); ok {
+			s5.Stop()
+		}
+		// При необходимости можно добавить остановку других типов (HTTP, UDP)
+	}
+
+	// Даём время горутинам на завершение (опционально)
+	// time.Sleep(100 * time.Millisecond)
+
+	log.Println("Shutdown complete")
 }
