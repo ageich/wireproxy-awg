@@ -60,6 +60,14 @@ type Socks5Config struct {
 	BindAddress string
 	Username    string
 	Password    string
+	resolver    *fixedResolver // добавлено поле для хранения резолвера
+}
+
+// Stop gracefully shuts down the SOCKS5 server's DNS resolver cleaner.
+func (c *Socks5Config) Stop() {
+	if c.resolver != nil {
+		c.resolver.Stop()
+	}
 }
 
 type HTTPConfig struct {
@@ -438,6 +446,7 @@ func parseSocks5Config(section *ini.Section) (RoutineSpawner, error) {
 	password, _ := parseString(section, "Password")
 	config.Password = password
 
+	// резолвер будет создан и сохранён позже в SpawnRoutine
 	return config, nil
 }
 
