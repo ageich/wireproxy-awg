@@ -105,13 +105,13 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 	// Main loop to read from local client and forward to remote
 	go func() {
-    for {
-        buf := make([]byte, 64*1024) // Создаём буфер внутри цикла
-        n, src, err := listener.ReadFromUDP(buf)
-        if err != nil {
-            log.Printf("UDPProxyTunnel: error reading from UDP: %v", err)
-            return // Выходим из горутины при ошибке, буфер будет собран GC
-        }
+		for {
+			buf := make([]byte, 64*1024) // Создаём буфер внутри цикла, чтобы не удерживать память
+			n, src, err := listener.ReadFromUDP(buf)
+			if err != nil {
+				log.Printf("UDPProxyTunnel: error reading from UDP: %v", err)
+				return // Выходим из горутины при ошибке, буфер будет собран GC
+			}
 
 			srcKey := src.String() // identify session by the local client's IP:port
 			s, err := getOrCreateSession(srcKey)
