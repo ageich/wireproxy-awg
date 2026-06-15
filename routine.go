@@ -50,6 +50,8 @@ type VirtualTun struct {
 	// PingRecord stores the last time an IP was pinged
 	PingRecord     map[string]uint64
 	PingRecordLock *sync.Mutex
+	// pingStop allows to stop the background ping goroutine
+	pingStop chan struct{}
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
@@ -462,15 +464,35 @@ func (d VirtualTun) pingIPs() {
 	}
 }
 
-func (d VirtualTun) StartPingIPs() {
+// StartPingIPs starts a background goroutine that periodically pings all configured IPs.
+// The goroutine can be stopped by calling StopPingIPs().
+func (d *VirtualTun) StartPingIPs() {
 	for _, addr := range d.Conf.CheckAlive {
 		d.PingRecord[addr.String()] = 0
 	}
 
+	if d.pingStop == nil {
+		d.pingStop = make(chan struct{})
+	}
+
 	go func() {
+		ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+		defer ticker.Stop()
 		for {
-			d.pingIPs()
-			time.Sleep(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+			select {
+			case <-d.pingStop:
+				return
+			case <-ticker.C:
+				d.pingIPs()
+			}
 		}
 	}()
+}
+
+// StopPingIPs stops the background ping goroutine if it is running.
+func (d *VirtualTun) StopPingIPs() {
+	if d.pingStop != nil {
+		close(d.pingStop)
+		d.pingStop = nil
+	}
 }
