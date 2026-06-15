@@ -125,7 +125,6 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	}
 
 	var ip net.IP
-	var err error
 	if r.systemDNS {
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
 		if err != nil || len(ips) == 0 {
