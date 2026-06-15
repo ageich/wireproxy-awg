@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/akamensky/argparse"
 	"github.com/amnezia-vpn/amneziawg-go/device"
@@ -154,7 +155,7 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) {
 
 func main() {
 	s := make(chan os.Signal, 1)
-	signal.Notify(s, syscall.SIGINT, syscall.SIGQUIT)
+	signal.Notify(s, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
@@ -257,11 +258,16 @@ func main() {
 	// Запускаем ICMP пинги
 	tun.StartPingIPs()
 
+	// HTTP-сервер для метрик (если включён)
+	var metricsServer *http.Server
 	if *info != "" {
+		metricsServer = &http.Server{
+			Addr:    *info,
+			Handler: tun,
+		}
 		go func() {
-			err := http.ListenAndServe(*info, tun)
-			if err != nil {
-				panic(err)
+			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("metrics server error: %v", err)
 			}
 		}()
 	}
@@ -272,6 +278,10 @@ func main() {
 	// --- Graceful shutdown: останавливаем все фоновые задачи ---
 	log.Println("Shutting down gracefully...")
 
+	// Создаём контекст с таймаутом для завершения
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
 	// Останавливаем ICMP пинги
 	tun.StopPingIPs()
 
@@ -280,11 +290,23 @@ func main() {
 		if s5, ok := spawner.(*wireproxyawg.Socks5Config); ok {
 			s5.Stop()
 		}
-		// При необходимости можно добавить остановку других типов (HTTP, UDP)
 	}
 
-	// Даём время горутинам на завершение (опционально)
-	// time.Sleep(100 * time.Millisecond)
+	// Останавливаем HTTP-сервер метрик
+	if metricsServer != nil {
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+	}
 
+	// Закрываем TUN-устройство и освобождаем ресурсы wireguard
+	if tun.Dev != nil {
+		tun.Dev.Close()
+	}
+	// Дополнительно: если есть ещё какие-то ресурсы в tun.Tnet, их можно закрыть,
+	// но обычно netstack не требует явного закрытия.
+
+	// Ждём завершения всех операций или таймаута
+	<-shutdownCtx.Done()
 	log.Println("Shutdown complete")
 }
