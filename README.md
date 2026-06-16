@@ -1,3 +1,4 @@
+Устранена утечка памяти по сравнению с оригинальными версиями.
 # wireproxy-awg
 
 [![ISC licensed](https://img.shields.io/badge/license-ISC-blue)](./LICENSE)
