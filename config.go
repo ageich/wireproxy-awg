@@ -83,6 +83,11 @@ type Configuration struct {
     Device   *DeviceConfig
     Routines []RoutineSpawner
     Resolve  *ResolveConfig
+
+    // <-- НОВЫЕ ПОЛЯ ДЛЯ РАЗМЕРОВ КЭШЕЙ
+    DnsCacheSize        int // размер DNS-кэша (LRU)
+    PingCacheSize       int // размер кэша для PingRecord
+    UdpSessionCacheSize int // размер кэша UDP-сессий
 }
 
 func parseString(section *ini.Section, keyName string) (string, error) {
@@ -605,9 +610,35 @@ func ParseConfig(path string) (*Configuration, error) {
         return nil, err
     }
 
-    return &Configuration{
+    // <-- СОЗДАНИЕ КОНФИГА С УМОЛЧАНИЯМИ ДЛЯ КЭШЕЙ
+    config := &Configuration{
         Device:   device,
         Routines: routinesSpawners,
         Resolve:  resolve,
-    }, nil
+
+        DnsCacheSize:        1000,
+        PingCacheSize:       500,
+        UdpSessionCacheSize: 500,
+    }
+
+    // <-- ЧТЕНИЕ СЕКЦИИ [Cache] ДЛЯ ПЕРЕОПРЕДЕЛЕНИЯ РАЗМЕРОВ
+    if cacheSection, err := cfg.GetSection("Cache"); err == nil {
+        if key, err := cacheSection.GetKey("DnsCacheSize"); err == nil {
+            if val, err := key.Int(); err == nil && val > 0 {
+                config.DnsCacheSize = val
+            }
+        }
+        if key, err := cacheSection.GetKey("PingCacheSize"); err == nil {
+            if val, err := key.Int(); err == nil && val > 0 {
+                config.PingCacheSize = val
+            }
+        }
+        if key, err := cacheSection.GetKey("UdpSessionCacheSize"); err == nil {
+            if val, err := key.Int(); err == nil && val > 0 {
+                config.UdpSessionCacheSize = val
+            }
+        }
+    }
+
+    return config, nil
 }
