@@ -7,6 +7,7 @@ require (
 	github.com/akamensky/argparse v1.4.0
 	github.com/amnezia-vpn/amneziawg-go v0.2.18
 	github.com/go-ini/ini v1.67.0
+    github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/landlock-lsm/go-landlock v0.6.0
 	github.com/things-go/go-socks5 v0.0.5
 	golang.org/x/net v0.47.0
