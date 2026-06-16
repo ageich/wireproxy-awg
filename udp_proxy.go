@@ -15,7 +15,16 @@ type udpSession struct {
 	remoteConn    net.Conn
 	lastActive    time.Time
 	closeChan     chan struct{}
+	closeOnce     sync.Once // гарантирует однократное закрытие closeChan
 	inactivityDur time.Duration
+}
+
+// Close безопасно закрывает канал и соединение сессии
+func (s *udpSession) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closeChan)
+		_ = s.remoteConn.Close()
+	})
 }
 
 // SpawnRoutine реализует интерфейс RoutineSpawner.
@@ -44,13 +53,8 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	// Создаём LRU-кэш сессий с колбэком при вытеснении
 	sessions, err := lru.NewWithEvict[string, *udpSession](cacheSize,
 		func(key string, sess *udpSession) {
-			// Закрываем соединение и канал при вытеснении из кэша
-			_ = sess.remoteConn.Close()
-			select {
-			case <-sess.closeChan:
-			default:
-				close(sess.closeChan)
-			}
+			// Безопасно закрываем сессию при вытеснении
+			sess.Close()
 		})
 	if err != nil {
 		log.Fatalf("UDPProxyTunnel: failed to create LRU cache: %v", err)
@@ -58,16 +62,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 	var sessionMu sync.Mutex // защищает операции с LRU
 
-	// Безопасно закрывает канал сессии (игнорирует, если уже закрыт)
-	closeSessionChan := func(sess *udpSession) {
-		select {
-		case <-sess.closeChan:
-		default:
-			close(sess.closeChan)
-		}
-	}
-
-	// Удаляет сессию из LRU и закрывает её (вызывается при таймауте или завершении)
+	// Удаляет сессию из LRU (если она ещё там) и закрывает её
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
@@ -156,7 +151,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(listener *net.UDPConn, srcAddr string, s *udpSession, removeSession func(string, *udpSession)) {
 	defer func() {
 		removeSession(srcAddr, s) // удаляем сессию из кэша (если она ещё там)
-		_ = s.remoteConn.Close()
+		s.Close()                 // безопасно закрываем ресурсы
 	}()
 	buf := make([]byte, 64*1024)
 
