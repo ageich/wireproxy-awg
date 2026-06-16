@@ -8,10 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"github.com/amnezia-vpn/amneziawg-go/device"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"io"
 	"log"
 	"math/rand"
@@ -24,8 +20,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/device"
+	"github.com/hashicorp/golang-lru/v2/expirable" // <-- НОВАЯ ЗАВИСИМОСТЬ
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/bufferpool"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 
 	"net/netip"
 
@@ -52,6 +53,8 @@ type VirtualTun struct {
 	PingRecordLock *sync.Mutex
 	// pingStop allows to stop the background ping goroutine
 	pingStop chan struct{}
+	// DnsCacheSize определяет максимальное количество записей в DNS-кэше (LRU)
+	DnsCacheSize int // <-- НОВОЕ ПОЛЕ
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
@@ -64,66 +67,34 @@ type addressPort struct {
 	port    uint16
 }
 
-// ---------- DNS resolver with limited cache (fixes infinite memory growth) ----------
-type cacheEntry struct {
-	ip      net.IP
-	created time.Time
-}
+// ---------- DNS resolver with LRU cache (limited memory growth) ----------
 
-// fixedResolver implements socks5.NameResolver with a cache that respects TTL
+// fixedResolver implements socks5.NameResolver with a bounded LRU cache + TTL
 type fixedResolver struct {
-	tnet        *netstack.Net
-	systemDNS   bool
-	cache       sync.Map // map[string]*cacheEntry
-	ttl         time.Duration
-	cleanupFreq time.Duration
-	stopCleanup chan struct{}
+	tnet      *netstack.Net
+	systemDNS bool
+	cache     *expirable.LRU[string, net.IP] // LRU с ограничением размера и TTL
 }
 
-// NewFixedResolver creates a new resolver with cache expiration
-func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl, cleanupFreq time.Duration) *fixedResolver {
-	r := &fixedResolver{
-		tnet:        tnet,
-		systemDNS:   systemDNS,
-		ttl:         ttl,
-		cleanupFreq: cleanupFreq,
-		stopCleanup: make(chan struct{}),
-	}
-	go r.cleanupLoop()
-	return r
-}
-
-func (r *fixedResolver) cleanupLoop() {
-	ticker := time.NewTicker(r.cleanupFreq)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.stopCleanup:
-			return
-		case <-ticker.C:
-			now := time.Now()
-			r.cache.Range(func(key, value interface{}) bool {
-				entry := value.(*cacheEntry)
-				if now.Sub(entry.created) >= r.ttl {
-					r.cache.Delete(key)
-				}
-				return true
-			})
-		}
+// NewFixedResolver creates a new resolver with LRU cache and TTL expiration
+func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cacheSize int) *fixedResolver {
+	// Создаём LRU-кэш с заданным размером и TTL (удаление происходит автоматически)
+	cache := expirable.NewLRU[string, net.IP](cacheSize, nil, ttl)
+	return &fixedResolver{
+		tnet:      tnet,
+		systemDNS: systemDNS,
+		cache:     cache,
 	}
 }
 
 // Resolve implements socks5.NameResolver
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	// Check cache
-	if cached, ok := r.cache.Load(name); ok {
-		entry := cached.(*cacheEntry)
-		if time.Since(entry.created) < r.ttl {
-			return ctx, entry.ip, nil
-		}
-		r.cache.Delete(name)
+	// Проверяем кэш
+	if ip, ok := r.cache.Get(name); ok {
+		return ctx, ip, nil
 	}
 
+	// Если не найдено, выполняем резолвинг
 	var ip net.IP
 	if r.systemDNS {
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
@@ -142,17 +113,17 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 		}
 	}
 
-	// Store in cache
-	r.cache.Store(name, &cacheEntry{ip: ip, created: time.Now()})
+	// Сохраняем в кэш (при превышении лимита вытеснится самая старая запись)
+	r.cache.Add(name, ip)
 	return ctx, ip, nil
 }
 
-// Stop cleanly shuts down the resolver's cleanup goroutine
+// Stop is a no-op for compatibility (cleanup is handled automatically by expirable.LRU)
 func (r *fixedResolver) Stop() {
-	close(r.stopCleanup)
+	// Ничего не делаем, так как expirable.LRU самостоятельно управляет памятью
 }
 
-// ---------- End of fixed DNS resolver ----------
+// ---------- End of DNS resolver ----------
 
 // LookupAddr lookups a hostname.
 // DNS traffic may or may not be routed depending on VirtualTun's setting
@@ -230,11 +201,10 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
-// SpawnRoutine spawns a socks5 server with fixed DNS resolver (no infinite cache)
+// SpawnRoutine spawns a socks5 server with fixed DNS resolver (LRU cache)
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
-	// Create a DNS resolver with a 5-minute TTL and cleanup every 10 minutes
-	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, 10*time.Minute)
-	// Сохраняем резолвер в конфиге для возможности остановки его горутины при завершении программы
+	// Используем TTL 5 минут и размер кэша из vt.DnsCacheSize (по умолчанию 1000)
+	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, vt.DnsCacheSize)
 	config.resolver = resolver
 
 	var authMethods []socks5.Authenticator
@@ -248,7 +218,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 
 	options := []socks5.Option{
 		socks5.WithDial(vt.Tnet.DialContext),
-		socks5.WithResolver(resolver), // use the fixed resolver instead of vt directly
+		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
 	}
