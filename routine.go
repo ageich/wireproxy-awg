@@ -43,6 +43,13 @@ type CredentialValidator struct {
 	password string
 }
 
+// Valid checks username and password in constant time.
+func (c CredentialValidator) Valid(username, password string) bool {
+	u := subtle.ConstantTimeCompare([]byte(c.username), []byte(username))
+	p := subtle.ConstantTimeCompare([]byte(c.password), []byte(password))
+	return u&p == 1
+}
+
 // VirtualTun stores a reference to netstack network and DNS configuration
 type VirtualTun struct {
 	Tnet      *netstack.Net
@@ -295,12 +302,6 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		go tcpServerForward(vt, raddr, conn)
 	}
 }
-
-// SpawnRoutine for UDPProxyTunnelConfig (добавлен позже)
-// Если у вас есть этот тип, раскомментируйте и добавьте реализацию.
-// func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-//     // реализация UDP-прокси
-// }
 
 // connForward copy data from `from` to `to`
 func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
