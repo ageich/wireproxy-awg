@@ -74,7 +74,7 @@ type addressPort struct {
 type fixedResolver struct {
 	tnet      *netstack.Net
 	systemDNS bool
-	cache     *expirable.LRU[string, net.IP] // LRU с ограничением размера и TTL
+	Cache     *expirable.LRU[string, net.IP] // экспортируемое поле для тестов
 }
 
 // NewFixedResolver creates a new resolver with LRU cache and TTL expiration
@@ -84,14 +84,14 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cac
 	return &fixedResolver{
 		tnet:      tnet,
 		systemDNS: systemDNS,
-		cache:     cache,
+		Cache:     cache,
 	}
 }
 
 // Resolve implements socks5.NameResolver
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	// Проверяем кэш
-	if ip, ok := r.cache.Get(name); ok {
+	if ip, ok := r.Cache.Get(name); ok {
 		return ctx, ip, nil
 	}
 
@@ -115,7 +115,7 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	}
 
 	// Сохраняем в кэш (при превышении лимита вытеснится самая старая запись)
-	r.cache.Add(name, ip)
+	r.Cache.Add(name, ip)
 	return ctx, ip, nil
 }
 
