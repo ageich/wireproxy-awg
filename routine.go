@@ -81,7 +81,6 @@ type fixedResolver struct {
 
 // NewFixedResolver creates a new resolver with LRU cache and TTL expiration
 func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cacheSize int) *fixedResolver {
-	// Создаём LRU-кэш с заданным размером и TTL (удаление происходит автоматически)
 	cache := expirable.NewLRU[string, net.IP](cacheSize, nil, ttl)
 	return &fixedResolver{
 		tnet:      tnet,
@@ -92,12 +91,10 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cac
 
 // Resolve implements socks5.NameResolver
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	// Проверяем кэш
 	if ip, ok := r.Cache.Get(name); ok {
 		return ctx, ip, nil
 	}
 
-	// Если не найдено, выполняем резолвинг
 	var ip net.IP
 	if r.systemDNS {
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
@@ -116,20 +113,18 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 		}
 	}
 
-	// Сохраняем в кэш (при превышении лимита вытеснится самая старая запись)
 	r.Cache.Add(name, ip)
 	return ctx, ip, nil
 }
 
 // Stop is a no-op for compatibility (cleanup is handled automatically by expirable.LRU)
 func (r *fixedResolver) Stop() {
-	// Ничего не делаем, так как expirable.LRU самостоятельно управляет памятью
+	// Nothing to do
 }
 
 // ---------- End of DNS resolver ----------
 
 // LookupAddr lookups a hostname.
-// DNS traffic may or may not be routed depending on VirtualTun's setting
 func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
 	if d.SystemDNS {
 		return net.DefaultResolver.LookupHost(ctx, name)
@@ -138,7 +133,6 @@ func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, erro
 }
 
 // ResolveAddrWithContext resolves a hostname and returns an AddrPort.
-// DNS traffic may or may not be routed depending on VirtualTun's setting
 func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*netip.Addr, error) {
 	addrs, err := d.LookupAddr(ctx, name)
 	if err != nil {
@@ -170,7 +164,6 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 }
 
 // Resolve resolves a hostname and returns an IP.
-// DNS traffic may or may not be routed depending on VirtualTun's setting
 func (d VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	addr, err := d.ResolveAddrWithContext(ctx, name)
 	if err != nil {
@@ -204,9 +197,10 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
-// SpawnRoutine spawns a socks5 server with fixed DNS resolver (LRU cache)
+// ---------- SpawnRoutine implementations ----------
+
+// SpawnRoutine for Socks5Config
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
-	// Используем TTL 5 минут и размер кэша из vt.DnsCacheSize (по умолчанию 1000)
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, vt.DnsCacheSize)
 	config.resolver = resolver
 
@@ -233,7 +227,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	}
 }
 
-// SpawnRoutine spawns a http server.
+// SpawnRoutine for HTTPConfig
 func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
 	server := &HTTPServer{
 		config: config,
@@ -249,13 +243,64 @@ func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 }
 
-// Valid checks the authentication data in CredentialValidator and compare them
-// to username and password in constant time.
-func (c CredentialValidator) Valid(username, password string) bool {
-	u := subtle.ConstantTimeCompare([]byte(c.username), []byte(username))
-	p := subtle.ConstantTimeCompare([]byte(c.password), []byte(password))
-	return u&p == 1
+// SpawnRoutine for TCPClientTunnelConfig
+func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+	raddr, err := parseAddressPort(conf.Target)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	server, err := net.ListenTCP("tcp", conf.BindAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go tcpClientForward(vt, raddr, conn)
+	}
 }
+
+// SpawnRoutine for STDIOTunnelConfig
+func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+	raddr, err := parseAddressPort(conf.Target)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	go STDIOTcpForward(vt, raddr)
+}
+
+// SpawnRoutine for TCPServerTunnelConfig
+func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+	raddr, err := parseAddressPort(conf.Target)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	addr := &net.TCPAddr{Port: conf.ListenPort}
+	server, err := vt.Tnet.ListenTCP(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go tcpServerForward(vt, raddr, conn)
+	}
+}
+
+// SpawnRoutine for UDPProxyTunnelConfig (добавлен позже)
+// Если у вас есть этот тип, раскомментируйте и добавьте реализацию.
+// func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+//     // реализация UDP-прокси
+// }
 
 // connForward copy data from `from` to `to`
 func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
@@ -289,11 +334,17 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 }
 
 // STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
-// Теперь принимает input и output файлы вместо глобальных.
-func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input, output *os.File) {
+func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
 		errorLogger.Printf("Name resolution error for %s: %s\n", raddr.address, err.Error())
+		return
+	}
+
+	// os.Stdout has previously been remapped to stderr, so we can't use it
+	stdout, err := os.OpenFile("/dev/stdout", os.O_WRONLY, 0)
+	if err != nil {
+		errorLogger.Printf("Failed to open /dev/stdout: %s\n", err.Error())
 		return
 	}
 
@@ -304,19 +355,8 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input, output *os.File)
 		return
 	}
 
-	go connForward(input, sconn)
-	go connForward(sconn, output)
-}
-
-// SpawnRoutine connects to the specified target and plumbs it to STDIN / STDOUT
-func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Передаём input и output из конфига
-	go STDIOTcpForward(vt, raddr, conf.Input, conf.Output)
+	go connForward(os.Stdin, sconn)
+	go connForward(sconn, stdout)
 }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
@@ -337,38 +377,15 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 
 	go connForward(sconn, conn)
 	go connForward(conn, sconn)
-
 }
 
-// SpawnRoutine spawns a TCP server on wireguard which acts as a proxy to the specified target
-func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
+// ---------- Health check and ping ----------
 
-	addr := &net.TCPAddr{Port: conf.ListenPort}
-	server, err := vt.Tnet.ListenTCP(addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go tcpServerForward(vt, raddr, conn)
-	}
-}
-
-// ServeHTTP обрабатывает HTTP-запросы для метрик (health check / metrics).
-// Использует LRU-кэш PingRecord для получения данных.
+// ServeHTTP handles health and metrics requests
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Health metric request: %s\n", r.URL.Path)
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
-		// Собираем данные из PingRecord
 		records := make(map[string]uint64)
 		for _, key := range d.PingRecord.Keys() {
 			if val, ok := d.PingRecord.Get(key); ok {
@@ -385,7 +402,6 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		for _, record := range records {
 			lastPong := time.Unix(int64(record), 0)
-			// +2 seconds to account for the time it takes to ping the IP
 			if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
 				status = http.StatusServiceUnavailable
 				break
@@ -508,33 +524,27 @@ func (d VirtualTun) pingIPs() {
 				}
 			}
 
-			// Сохраняем время успешного пинга в LRU-кэш (потокобезопасно)
 			d.PingRecord.Add(addr.String(), uint64(time.Now().Unix()))
 		}()
 	}
 }
 
 // StartPingIPs starts a background goroutine that periodically pings all configured IPs.
-// The goroutine can be stopped by calling StopPingIPs().
 func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
-	// Инициализируем кэш нулевыми значениями для всех проверяемых адресов
 	for _, addr := range d.Conf.CheckAlive {
 		d.PingRecord.Add(addr.String(), 0)
 	}
 
-	// Если канал уже существует, значит горутина уже запущена
 	if d.pingStop != nil {
 		return
 	}
 
-	// Создаём новый канал и сохраняем его
 	stopChan := make(chan struct{})
 	d.pingStop = stopChan
 
-	// Запускаем горутину с локальной переменной канала
 	go func(stop <-chan struct{}) {
 		ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
 		defer ticker.Stop()
