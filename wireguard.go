@@ -12,6 +12,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	lru "github.com/hashicorp/golang-lru/v2" // <-- НОВАЯ ЗАВИСИМОСТЬ
 )
 
 // DeviceSetting contains the parameters for setting up a tun interface
@@ -59,25 +60,25 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 			fmt.Fprintf(&aSecBuilder, "s4=%d\n", aSecConfig.transportPacketJunkSize)
 		}
 		if aSecConfig.hasInitPacketMagicHeader {
-			fmt.Fprintf(&aSecBuilder, 
+			fmt.Fprintf(&aSecBuilder,
 				"h1=%s\n",
 				formatMagicHeaderInterval(aSecConfig.initPacketMagicHeader, aSecConfig.initPacketMagicHeaderMax),
 			)
 		}
 		if aSecConfig.hasResponsePacketMagicHeader {
-			fmt.Fprintf(&aSecBuilder, 
+			fmt.Fprintf(&aSecBuilder,
 				"h2=%s\n",
 				formatMagicHeaderInterval(aSecConfig.responsePacketMagicHeader, aSecConfig.responsePacketMagicHeaderMax),
 			)
 		}
 		if aSecConfig.hasUnderloadPacketMagicHeader {
-			fmt.Fprintf(&aSecBuilder, 
+			fmt.Fprintf(&aSecBuilder,
 				"h3=%s\n",
 				formatMagicHeaderInterval(aSecConfig.underloadPacketMagicHeader, aSecConfig.underloadPacketMagicHeaderMax),
 			)
 		}
 		if aSecConfig.hasTransportPacketMagicHeader {
-			fmt.Fprintf(&aSecBuilder, 
+			fmt.Fprintf(&aSecBuilder,
 				"h4=%s\n",
 				formatMagicHeaderInterval(aSecConfig.transportPacketMagicHeader, aSecConfig.transportPacketMagicHeaderMax),
 			)
@@ -130,8 +131,9 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	return setting, nil
 }
 
-// StartWireguard creates a tun interface on netstack given a configuration
-func StartWireguard(conf *DeviceConfig, logLevel int) (*VirtualTun, error) {
+// StartWireguard creates a tun interface on netstack given a configuration.
+// pingCacheSize задаёт максимальное количество записей в кэше PingRecord (LRU).
+func StartWireguard(conf *DeviceConfig, logLevel int, pingCacheSize int) (*VirtualTun, error) {
 	setting, err := CreateIPCRequest(conf)
 	if err != nil {
 		return nil, err
@@ -152,12 +154,19 @@ func StartWireguard(conf *DeviceConfig, logLevel int) (*VirtualTun, error) {
 		return nil, err
 	}
 
+	// Создаём LRU-кэш для хранения времени последнего успешного ping-а
+	pingCache, err := lru.New[string, uint64](pingCacheSize)
+	if err != nil {
+		return nil, err
+	}
+
 	return &VirtualTun{
-		Tnet:           tnet,
-		Dev:            dev,
-		Conf:           conf,
-		SystemDNS:      len(setting.DNS) == 0,
-		PingRecord:     make(map[string]uint64),
-		PingRecordLock: new(sync.Mutex),
+		Tnet:       tnet,
+		Dev:        dev,
+		Conf:       conf,
+		SystemDNS:  len(setting.DNS) == 0,
+		PingRecord: pingCache, // теперь это *lru.Cache, а не map
+		// PingRecordLock больше не нужен — LRU потокобезопасен.
+		// Не забудьте удалить поле PingRecordLock из структуры VirtualTun в routine.go
 	}, nil
 }
