@@ -6,10 +6,11 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-// udpSession represents a UDP forwarding session, keyed by the local source address.
-// remoteConn is the UDP connection to the remote endpoint (on the WireGuard side).
+// udpSession представляет сессию переадресации UDP (клиент -> удалённый хост)
 type udpSession struct {
 	remoteConn    net.Conn
 	lastActive    time.Time
@@ -17,9 +18,9 @@ type udpSession struct {
 	inactivityDur time.Duration
 }
 
-// SpawnRoutine implements the RoutineSpawner interface.
-// It starts listening on config.BindAddress, handling each unique source (client) address
-// with its own udpSession. If InactivityTimeout > 0, sessions automatically close after inactivity
+// SpawnRoutine реализует интерфейс RoutineSpawner.
+// Запускает UDP-прокси с ограниченным LRU-кэшем сессий.
+// Размер кэша задаётся в vt.UdpSessionCacheSize (по умолчанию 500).
 func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
 	if err != nil {
@@ -32,9 +33,30 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 	log.Printf("UDPProxyTunnel listening on %s, forwarding to %s", conf.BindAddress, conf.Target)
 
+	// Определяем размер кэша (если не задан, используем 500)
+	cacheSize := vt.UdpSessionCacheSize
+	if cacheSize <= 0 {
+		cacheSize = 500
+	}
+
 	inactivityDur := time.Duration(conf.InactivityTimeout) * time.Second
-	sessions := make(map[string]*udpSession)
-	var sessionMu sync.Mutex
+
+	// Создаём LRU-кэш сессий с колбэком при вытеснении
+	sessions, err := lru.NewWithEvict[string, *udpSession](cacheSize,
+		func(key string, sess *udpSession) {
+			// Закрываем соединение и канал при вытеснении из кэша
+			_ = sess.remoteConn.Close()
+			select {
+			case <-sess.closeChan:
+			default:
+				close(sess.closeChan)
+			}
+		})
+	if err != nil {
+		log.Fatalf("UDPProxyTunnel: failed to create LRU cache: %v", err)
+	}
+
+	var sessionMu sync.Mutex // защищает операции с LRU
 
 	// Безопасно закрывает канал сессии (игнорирует, если уже закрыт)
 	closeSessionChan := func(sess *udpSession) {
@@ -45,16 +67,16 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}
 	}
 
-	// Удаляет сессию из map (канал при этом не закрывает — это делает таймаут или handleRemoteToLocal)
+	// Удаляет сессию из LRU и закрывает её (вызывается при таймауте или завершении)
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
-		if current, ok := sessions[src]; ok && current == sess {
-			delete(sessions, src)
+		defer sessionMu.Unlock()
+		if current, ok := sessions.Get(src); ok && current == sess {
+			sessions.Remove(src) // вызовет колбэк, который закроет ресурсы
 		}
-		sessionMu.Unlock()
 	}
 
-	// Периодически закрываем неактивные сессии (только закрываем канал, не удаляем из map)
+	// Периодически проверяем неактивные сессии (если задан InactivityTimeout)
 	if conf.InactivityTimeout > 0 {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
@@ -62,11 +84,13 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 			for range ticker.C {
 				now := time.Now()
 				sessionMu.Lock()
-				for key, sess := range sessions {
-					if now.Sub(sess.lastActive) >= inactivityDur {
-						log.Printf("UDPProxyTunnel: closing inactive session for %s", key)
-						closeSessionChan(sess) // сигнализируем handleRemoteToLocal о завершении
-						// НЕ удаляем из map — это сделает handleRemoteToLocal в своём defer
+				for _, key := range sessions.Keys() {
+					if sess, ok := sessions.Get(key); ok {
+						if now.Sub(sess.lastActive) >= inactivityDur {
+							log.Printf("UDPProxyTunnel: closing inactive session for %s", key)
+							// Удаляем из кэша (колбэк закроет ресурсы)
+							sessions.Remove(key)
+						}
 					}
 				}
 				sessionMu.Unlock()
@@ -79,7 +103,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 
-		if s, ok := sessions[srcAddr]; ok {
+		if s, ok := sessions.Get(srcAddr); ok {
 			s.lastActive = time.Now()
 			return s, nil
 		}
@@ -95,7 +119,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 			closeChan:     make(chan struct{}),
 			inactivityDur: inactivityDur,
 		}
-		sessions[srcAddr] = s
+		sessions.Add(srcAddr, s)
 
 		// Запускаем обработчик трафика из удалённой стороны в локальную
 		go conf.handleRemoteToLocal(listener, srcAddr, s, removeSession)
@@ -131,7 +155,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 // handleRemoteToLocal читает данные из удалённого соединения и отправляет их обратно локальному клиенту
 func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(listener *net.UDPConn, srcAddr string, s *udpSession, removeSession func(string, *udpSession)) {
 	defer func() {
-		removeSession(srcAddr, s) // удаляем сессию из map
+		removeSession(srcAddr, s) // удаляем сессию из кэша (если она ещё там)
 		_ = s.remoteConn.Close()
 	}()
 	buf := make([]byte, 64*1024)
