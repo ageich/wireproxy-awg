@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"sync"
 
 	"net/netip"
 
@@ -12,7 +11,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
-	lru "github.com/hashicorp/golang-lru/v2" // <-- НОВАЯ ЗАВИСИМОСТЬ
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // DeviceSetting contains the parameters for setting up a tun interface
@@ -165,8 +164,6 @@ func StartWireguard(conf *DeviceConfig, logLevel int, pingCacheSize int) (*Virtu
 		Dev:        dev,
 		Conf:       conf,
 		SystemDNS:  len(setting.DNS) == 0,
-		PingRecord: pingCache, // теперь это *lru.Cache, а не map
-		// PingRecordLock больше не нужен — LRU потокобезопасен.
-		// Не забудьте удалить поле PingRecordLock из структуры VirtualTun в routine.go
+		PingRecord: pingCache,
 	}, nil
 }
