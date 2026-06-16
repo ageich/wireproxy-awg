@@ -289,17 +289,11 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 }
 
 // STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
-func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
+// Теперь принимает input и output файлы вместо глобальных.
+func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input, output *os.File) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
 		errorLogger.Printf("Name resolution error for %s: %s\n", raddr.address, err.Error())
-		return
-	}
-
-	// os.Stdout has previously been remapped to stderr, se we can't use it
-	stdout, err := os.OpenFile("/dev/stdout", os.O_WRONLY, 0)
-	if err != nil {
-		errorLogger.Printf("Failed to open /dev/stdout: %s\n", err.Error())
 		return
 	}
 
@@ -310,29 +304,8 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 		return
 	}
 
-	go connForward(os.Stdin, sconn)
-	go connForward(sconn, stdout)
-}
-
-// SpawnRoutine spawns a local TCP server which acts as a proxy to the specified target
-func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	server, err := net.ListenTCP("tcp", conf.BindAddress)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go tcpClientForward(vt, raddr, conn)
-	}
+	go connForward(input, sconn)
+	go connForward(sconn, output)
 }
 
 // SpawnRoutine connects to the specified target and plumbs it to STDIN / STDOUT
@@ -342,7 +315,8 @@ func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		log.Fatal(err)
 	}
 
-	go STDIOTcpForward(vt, raddr)
+	// Передаём input и output из конфига
+	go STDIOTcpForward(vt, raddr, conf.Input, conf.Output)
 }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
