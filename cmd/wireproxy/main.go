@@ -245,10 +245,15 @@ func main() {
 
 	lock("ready")
 
-	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel)
+	// <-- Изменение: передаём conf.PingCacheSize как третий аргумент
+	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel, conf.PingCacheSize)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// <-- Устанавливаем размеры кэшей DNS и UDP-сессий из конфигурации
+	tun.DnsCacheSize = conf.DnsCacheSize
+	tun.UdpSessionCacheSize = conf.UdpSessionCacheSize
 
 	// Запускаем все роутины (SOCKS5, HTTP, UDP прокси и т.д.)
 	for _, spawner := range conf.Routines {
@@ -303,8 +308,6 @@ func main() {
 	if tun.Dev != nil {
 		tun.Dev.Close()
 	}
-	// Дополнительно: если есть ещё какие-то ресурсы в tun.Tnet, их можно закрыть,
-	// но обычно netstack не требует явного закрытия.
 
 	// Ждём завершения всех операций или таймаута
 	<-shutdownCtx.Done()
