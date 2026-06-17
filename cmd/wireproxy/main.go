@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
@@ -31,12 +32,10 @@ var defaultConfigPaths = []string{
 
 var version = "1.0.15-dev"
 
-// lock возвращает ошибку вместо паники
 func lock(stage string) error {
 	switch stage {
 	case "boot":
 		exePath := executablePath()
-		// OpenBSD
 		if err := protect.Unveil("/", "r"); err != nil {
 			return fmt.Errorf("unveil /: %w", err)
 		}
@@ -46,7 +45,6 @@ func lock(stage string) error {
 		if err := protect.Pledge("stdio rpath inet dns proc exec"); err != nil {
 			return fmt.Errorf("pledge: %w", err)
 		}
-		// Linux
 		if err := landlock.V1.BestEffort().RestrictPaths(
 			landlock.RODirs("/"),
 		); err != nil {
@@ -140,6 +138,36 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error
 	return landlock.V4.BestEffort().RestrictNet(rules...)
 }
 
+func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
+	// Сначала пробуем прочитать переменную окружения GOMEMLIMIT
+	envLimit := os.Getenv("GOMEMLIMIT")
+	var limitBytes int64 = 0
+
+	if envLimit != "" {
+		if val, err := strconv.ParseInt(envLimit, 10, 64); err == nil && val > 0 {
+			limitBytes = val
+		} else {
+			log.Printf("Warning: GOMEMLIMIT environment variable has invalid value: %s", envLimit)
+		}
+	}
+
+	// Если передан флаг --max-memory и он > 0, то переопределяем
+	if memlimitFlag != nil && *memlimitFlag > 0 {
+		flagBytes := int64(*memlimitFlag) * 1024 * 1024
+		limitBytes = flagBytes
+	}
+
+	// Если лимит определён, устанавливаем его
+	if limitBytes > 0 {
+		debug.SetMemoryLimit(limitBytes)
+		log.Printf("Memory limit set to %d MB (%.2f GiB)", limitBytes/(1024*1024), float64(limitBytes)/(1024*1024*1024))
+	} else {
+		// Если лимит не задан, можно сбросить ограничение (но по умолчанию оно бесконечно)
+		// debug.SetMemoryLimit(math.MaxInt64) // необязательно
+		log.Println("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
+	}
+}
+
 func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
@@ -173,12 +201,16 @@ func main() {
 	info := parser.String("i", "info", &argparse.Options{Help: "Specify the address and port for exposing health status"})
 	printVerison := parser.Flag("v", "version", &argparse.Options{Help: "Print version"})
 	configTest := parser.Flag("n", "configtest", &argparse.Options{Help: "Configtest mode. Only check the configuration file for validity."})
+	memlimit := parser.Int("", "max-memory", &argparse.Options{Help: "Set maximum memory limit in megabytes (overrides GOMEMLIMIT env if set)"})
 
 	err := parser.Parse(args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
 		os.Exit(1)
 	}
+
+	// Установка лимита памяти (использует GOMEMLIMIT и/или флаг)
+	setMemoryLimitFromEnvAndFlags(memlimit)
 
 	if *printVerison {
 		fmt.Printf("wireproxy, version %s\n", version)
