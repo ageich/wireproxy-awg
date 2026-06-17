@@ -30,7 +30,7 @@ var defaultConfigPaths = []string{
 	os.Getenv("HOME") + "/.config/wireproxy.conf",
 }
 
-var version = "1.0.15-dev"
+var version = "1.0.17-dev"
 
 func lock(stage string) error {
 	switch stage {
