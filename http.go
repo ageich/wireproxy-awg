@@ -72,16 +72,16 @@ func (s *HTTPServer) handleConn(req *http.Request, conn net.Conn) (peer net.Conn
 
 	peer, err = s.dial("tcp", addr)
 	if err != nil {
-		return peer, fmt.Errorf("tun tcp dial failed: %w", err)
+		return nil, fmt.Errorf("tun tcp dial failed: %w", err)
 	}
 
 	_, err = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	if err != nil {
 		_ = peer.Close()
-		peer = nil
+		return nil, fmt.Errorf("write response failed: %w", err)
 	}
 
-	return
+	return peer, nil
 }
 
 func (s *HTTPServer) handle(req *http.Request) (peer net.Conn, err error) {
@@ -93,20 +93,22 @@ func (s *HTTPServer) handle(req *http.Request) (peer net.Conn, err error) {
 
 	peer, err = s.dial("tcp", addr)
 	if err != nil {
-		return peer, fmt.Errorf("tun tcp dial failed: %w", err)
+		return nil, fmt.Errorf("tun tcp dial failed: %w", err)
 	}
 
 	err = req.Write(peer)
 	if err != nil {
 		_ = peer.Close()
-		peer = nil
-		return peer, fmt.Errorf("conn write failed: %w", err)
+		return nil, fmt.Errorf("conn write failed: %w", err)
 	}
 
-	return
+	return peer, nil
 }
 
 func (s *HTTPServer) serve(conn net.Conn) {
+	// Гарантированно закрываем клиентское соединение при выходе
+	defer conn.Close()
+
 	var rd = bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
 	if err != nil {
@@ -138,31 +140,37 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	}
 	if err != nil {
 		log.Printf("dial proxy failed: %s\n", err)
+		if peer != nil {
+			_ = peer.Close()
+		}
 		return
 	}
 	if peer == nil {
 		log.Println("dial proxy failed: peer nil")
 		return
 	}
+	// Гарантируем закрытие peer при любом выходе из serve после успешного подключения
+	defer func() {
+		if peer != nil {
+			_ = peer.Close()
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		// Используем CopyWithPool вместо io.Copy
 		_, _ = CopyWithPool(conn, peer)
 	}()
 
 	go func() {
 		defer wg.Done()
-		// Используем CopyWithPool вместо io.Copy
 		_, _ = CopyWithPool(peer, conn)
 	}()
 
 	wg.Wait()
-	conn.Close()
-	peer.Close()
+	// conn закроется через defer, peer закроется через defer
 }
 
 // ListenAndServe is used to create a listener and serve on it
