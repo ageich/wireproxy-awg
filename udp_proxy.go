@@ -18,14 +18,13 @@ type udpSession struct {
 	inactivityDur time.Duration
 }
 
-// UDPProxyTunnelConfig расширена для поддержки динамического изменения размера
+// UDPProxyTunnelConfig — полная структура с полями для управления кэшем
 type UDPProxyTunnelConfig struct {
 	BindAddress       string
 	Target            string
 	InactivityTimeout int
-	// для динамического изменения
-	sessions *lru.Cache[string, *udpSession]
-	mu       sync.Mutex
+	mu                sync.Mutex
+	sessions          *lru.Cache[string, *udpSession]
 }
 
 // SetCacheSize изменяет размер кэша сессий.
@@ -33,9 +32,8 @@ func (conf *UDPProxyTunnelConfig) SetCacheSize(newSize int) error {
 	conf.mu.Lock()
 	defer conf.mu.Unlock()
 	if conf.sessions == nil {
-		return nil // ещё не создан
+		return nil
 	}
-	// Создаём новый кэш с новым размером и таким же evict-колбэком
 	newCache, err := lru.NewWithEvict[string, *udpSession](newSize, func(key string, sess *udpSession) {
 		_ = sess.remoteConn.Close()
 		select {
@@ -47,13 +45,11 @@ func (conf *UDPProxyTunnelConfig) SetCacheSize(newSize int) error {
 	if err != nil {
 		return err
 	}
-	// Заменяем старый кэш новым. Старые сессии продолжат жить до таймаута.
 	conf.sessions = newCache
 	return nil
 }
 
 // SpawnUDPProxy реализует основную логику UDP-прокси.
-// Вынесена из SpawnRoutine для возможности переиспользования.
 func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
 	if err != nil {
@@ -73,7 +69,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 
 	inactivityDur := time.Duration(conf.InactivityTimeout) * time.Second
 
-	// Создаём LRU-кэш и сохраняем в конфиг
 	sessions, err := lru.NewWithEvict[string, *udpSession](cacheSize,
 		func(key string, sess *udpSession) {
 			_ = sess.remoteConn.Close()
@@ -103,12 +98,13 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
-		// Используем актуальный кэш из конфига
 		conf.mu.Lock()
 		currentCache := conf.sessions
 		conf.mu.Unlock()
-		if current, ok := currentCache.Get(src); ok && current == sess {
-			currentCache.Remove(src)
+		if current != nil {
+			if current, ok := currentCache.Get(src); ok && current == sess {
+				currentCache.Remove(src)
+			}
 		}
 	}
 
@@ -193,11 +189,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 			PutBuffer(buf)
 		}
 	}()
-}
-
-// SpawnRoutine реализует интерфейс RoutineSpawner
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	conf.SpawnUDPProxy(vt)
 }
 
 // handleRemoteToLocal читает данные из удалённого соединения и отправляет их обратно локальному клиенту
