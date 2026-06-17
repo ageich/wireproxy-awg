@@ -139,10 +139,8 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error
 }
 
 func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
-	// Сначала пробуем прочитать переменную окружения GOMEMLIMIT
 	envLimit := os.Getenv("GOMEMLIMIT")
 	var limitBytes int64 = 0
-
 	if envLimit != "" {
 		if val, err := strconv.ParseInt(envLimit, 10, 64); err == nil && val > 0 {
 			limitBytes = val
@@ -150,34 +148,23 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
 			log.Printf("Warning: GOMEMLIMIT environment variable has invalid value: %s", envLimit)
 		}
 	}
-
-	// Если передан флаг --max-memory и он > 0, то переопределяем
 	if memlimitFlag != nil && *memlimitFlag > 0 {
 		flagBytes := int64(*memlimitFlag) * 1024 * 1024
 		limitBytes = flagBytes
 	}
-
-	// Если лимит определён, устанавливаем его
 	if limitBytes > 0 {
 		debug.SetMemoryLimit(limitBytes)
 		log.Printf("Memory limit set to %d MB (%.2f GiB)", limitBytes/(1024*1024), float64(limitBytes)/(1024*1024*1024))
 	} else {
-		// Если лимит не задан, можно сбросить ограничение (но по умолчанию оно бесконечно)
-		// debug.SetMemoryLimit(math.MaxInt64) // необязательно
 		log.Println("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
 	}
 }
 
 func main() {
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	go func() {
-		<-sigs
-		cancel()
-	}()
 
 	exePath := executablePath()
 	if err := lock("boot"); err != nil {
@@ -209,7 +196,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Установка лимита памяти (использует GOMEMLIMIT и/или флаг)
 	setMemoryLimitFromEnvAndFlags(memlimit)
 
 	if *printVerison {
@@ -263,7 +249,6 @@ func main() {
 		return
 	}
 
-	// redirect stdout to stderr
 	os.Stdout = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
 	logLevel := device.LogLevelVerbose
 	if *silent {
@@ -299,6 +284,44 @@ func main() {
 			}
 		}()
 	}
+
+	// Собираем объекты, поддерживающие перезагрузку
+	var reloadables []wireproxyawg.Reloadable
+	for _, r := range conf.Routines {
+		if rl, ok := r.(wireproxyawg.Reloadable); ok {
+			reloadables = append(reloadables, rl)
+		}
+	}
+
+	// Обработка сигналов
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+
+	go func() {
+		for sig := range signalChan {
+			switch sig {
+			case syscall.SIGHUP:
+				log.Println("Received SIGHUP, reloading configuration...")
+				newConf, err := wireproxyawg.ParseConfig(*config)
+				if err != nil {
+					log.Printf("Failed to reload config: %v", err)
+					continue
+				}
+				for _, rl := range reloadables {
+					if err := rl.Reload(newConf); err != nil {
+						log.Printf("Reload failed for %T: %v", rl, err)
+					}
+				}
+				// Обновляем глобальные размеры кэшей в tun (если они используются)
+				tun.DnsCacheSize = newConf.DnsCacheSize
+				tun.UdpSessionCacheSize = newConf.UdpSessionCacheSize
+				log.Println("Configuration reloaded successfully")
+			default:
+				cancel()
+				return
+			}
+		}
+	}()
 
 	// wait for signal
 	<-ctx.Done()
