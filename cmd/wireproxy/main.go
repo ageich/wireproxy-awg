@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/landlock-lsm/go-landlock/landlock"
 	"log"
 	"net"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"github.com/akamensky/argparse"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	wireproxyawg "github.com/ageich/wireproxy-awg"
+	"github.com/landlock-lsm/go-landlock/landlock"
 	"suah.dev/protect"
 )
 
@@ -24,75 +24,46 @@ import (
 const daemonProcess = "daemon-process"
 
 // default paths for wireproxy config file
-var default_config_paths = []string{
+var defaultConfigPaths = []string{
 	"/etc/wireproxy/wireproxy.conf",
 	os.Getenv("HOME") + "/.config/wireproxy.conf",
 }
 
-var version = "1.0.16-dev"
+var version = "1.0.15-dev"
 
-func panicIfError(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// attempts to pledge and panic if it fails
-// this does nothing on non-OpenBSD systems
-func pledgeOrPanic(promises string) {
-	panicIfError(protect.Pledge(promises))
-}
-
-// attempts to unveil and panic if it fails
-// this does nothing on non-OpenBSD systems
-func unveilOrPanic(path string, flags string) {
-	panicIfError(protect.Unveil(path, flags))
-}
-
-// get the executable path via syscalls or infer it from argv
-func executablePath() string {
-	programPath, err := os.Executable()
-	if err != nil {
-		return os.Args[0]
-	}
-	return programPath
-}
-
-// check if default config file paths exist
-func configFilePath() (string, bool) {
-	for _, path := range default_config_paths {
-		if _, err := os.Stat(path); err == nil {
-			return path, true
-		}
-	}
-	return "", false
-}
-
-func lock(stage string) {
+// lock возвращает ошибку вместо паники
+func lock(stage string) error {
 	switch stage {
 	case "boot":
 		exePath := executablePath()
 		// OpenBSD
-		unveilOrPanic("/", "r")
-		unveilOrPanic(exePath, "x")
-		// only allow standard stdio operation, file reading, networking, and exec
-		// also remove unveil permission to lock unveil
-		pledgeOrPanic("stdio rpath inet dns proc exec")
+		if err := protect.Unveil("/", "r"); err != nil {
+			return fmt.Errorf("unveil /: %w", err)
+		}
+		if err := protect.Unveil(exePath, "x"); err != nil {
+			return fmt.Errorf("unveil %s: %w", exePath, err)
+		}
+		if err := protect.Pledge("stdio rpath inet dns proc exec"); err != nil {
+			return fmt.Errorf("pledge: %w", err)
+		}
 		// Linux
-		panicIfError(landlock.V1.BestEffort().RestrictPaths(
+		if err := landlock.V1.BestEffort().RestrictPaths(
 			landlock.RODirs("/"),
-		))
+		); err != nil {
+			return fmt.Errorf("landlock: %w", err)
+		}
 	case "boot-daemon":
+		// nothing
 	case "read-config":
-		// OpenBSD
-		pledgeOrPanic("stdio rpath inet dns")
+		if err := protect.Pledge("stdio rpath inet dns"); err != nil {
+			return fmt.Errorf("pledge: %w", err)
+		}
 	case "ready":
-		// no file access is allowed from now on, only networking
-		// OpenBSD
-		pledgeOrPanic("stdio inet dns")
-		// Linux
-		net.DefaultResolver.PreferGo = true // needed to lock down dependencies
-		panicIfError(landlock.V1.BestEffort().RestrictPaths(
+		if err := protect.Pledge("stdio inet dns"); err != nil {
+			return fmt.Errorf("pledge: %w", err)
+		}
+		net.DefaultResolver.PreferGo = true
+		if err := landlock.V1.BestEffort().RestrictPaths(
 			landlock.ROFiles("/etc/resolv.conf").IgnoreIfMissing(),
 			landlock.ROFiles("/dev/fd").IgnoreIfMissing(),
 			landlock.ROFiles("/dev/zero").IgnoreIfMissing(),
@@ -111,10 +82,30 @@ func lock(stage string) {
 			landlock.RWFiles("/dev/null").IgnoreIfMissing(),
 			landlock.RWFiles("/dev/full").IgnoreIfMissing(),
 			landlock.RWFiles("/proc/self/fd").IgnoreIfMissing(),
-		))
+		); err != nil {
+			return fmt.Errorf("landlock: %w", err)
+		}
 	default:
-		panic("invalid stage")
+		return fmt.Errorf("invalid stage %s", stage)
 	}
+	return nil
+}
+
+func executablePath() string {
+	programPath, err := os.Executable()
+	if err != nil {
+		return os.Args[0]
+	}
+	return programPath
+}
+
+func configFilePath() (string, bool) {
+	for _, path := range defaultConfigPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func extractPort(addr string) uint16 {
@@ -122,21 +113,18 @@ func extractPort(addr string) uint16 {
 	if err != nil {
 		panic(fmt.Errorf("failed to extract port from %s: %w", addr, err))
 	}
-
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		panic(fmt.Errorf("failed to extract port from %s: %w", addr, err))
 	}
-
 	return uint16(port)
 }
 
-func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) {
+func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error {
 	var rules []landlock.Rule
 	if infoAddr != nil && *infoAddr != "" {
 		rules = append(rules, landlock.BindTCP(extractPort(*infoAddr)))
 	}
-
 	for _, section := range sections {
 		switch section := section.(type) {
 		case *wireproxyawg.TCPServerTunnelConfig:
@@ -149,32 +137,36 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) {
 			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
 		}
 	}
-
-	panicIfError(landlock.V4.BestEffort().RestrictNet(rules...))
+	return landlock.V4.BestEffort().RestrictNet(rules...)
 }
 
 func main() {
-	s := make(chan os.Signal, 1)
-	signal.Notify(s, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	go func() {
-		<-s
+		<-sigs
 		cancel()
 	}()
 
 	exePath := executablePath()
-	lock("boot")
+	if err := lock("boot"); err != nil {
+		log.Fatalf("Lock boot failed: %v", err)
+	}
 
 	isDaemonProcess := len(os.Args) > 1 && os.Args[1] == daemonProcess
 	args := os.Args
 	if isDaemonProcess {
-		lock("boot-daemon")
+		if err := lock("boot-daemon"); err != nil {
+			log.Fatalf("Lock boot-daemon failed: %v", err)
+		}
 		args = []string{args[0]}
 		args = append(args, os.Args[2:]...)
 	}
-	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 
+	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 	config := parser.String("c", "config", &argparse.Options{Help: "Path of configuration file"})
 	silent := parser.Flag("s", "silent", &argparse.Options{Help: "Silent mode"})
 	daemon := parser.Flag("d", "daemon", &argparse.Options{Help: "Make wireproxy run in background"})
@@ -185,7 +177,7 @@ func main() {
 	err := parser.Parse(args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
-		return
+		os.Exit(1)
 	}
 
 	if *printVerison {
@@ -194,21 +186,23 @@ func main() {
 	}
 
 	if *config == "" {
-		if path, config_exist := configFilePath(); config_exist {
+		if path, exists := configFilePath(); exists {
 			*config = path
 		} else {
 			fmt.Println("configuration path is required")
-			return
+			os.Exit(1)
 		}
 	}
 
 	if !*daemon {
-		lock("read-config")
+		if err := lock("read-config"); err != nil {
+			log.Fatalf("Lock read-config failed: %v", err)
+		}
 	}
 
 	conf, err := wireproxyawg.ParseConfig(*config)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Parse config failed: %v", err)
 	}
 
 	if *configTest {
@@ -216,7 +210,9 @@ func main() {
 		return
 	}
 
-	lockNetwork(conf.Routines, info)
+	if err := lockNetwork(conf.Routines, info); err != nil {
+		log.Fatalf("Lock network failed: %v", err)
+	}
 
 	if isDaemonProcess {
 		os.Stdout, _ = os.Open(os.DevNull)
@@ -230,40 +226,35 @@ func main() {
 		err = cmd.Start()
 		if err != nil {
 			fmt.Println(err.Error())
+			os.Exit(1)
 		}
 		return
 	}
 
-	// Wireguard doesn't allow configuring which FD to use for logging
-	// https://github.com/WireGuard/wireguard-go/blob/master/device/logger.go#L39
-	// so redirect STDOUT to STDERR, we don't want to print anything to STDOUT anyways
+	// redirect stdout to stderr
 	os.Stdout = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
 	logLevel := device.LogLevelVerbose
 	if *silent {
 		logLevel = device.LogLevelSilent
 	}
 
-	lock("ready")
-
-	// <-- Изменение: передаём conf.PingCacheSize как третий аргумент
-	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel, conf.PingCacheSize)
-	if err != nil {
-		log.Fatal(err)
+	if err := lock("ready"); err != nil {
+		log.Fatalf("Lock ready failed: %v", err)
 	}
 
-	// <-- Устанавливаем размеры кэшей DNS и UDP-сессий из конфигурации
+	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel, conf.PingCacheSize)
+	if err != nil {
+		log.Fatalf("Start wireguard failed: %v", err)
+	}
 	tun.DnsCacheSize = conf.DnsCacheSize
 	tun.UdpSessionCacheSize = conf.UdpSessionCacheSize
 
-	// Запускаем все роутины (SOCKS5, HTTP, UDP прокси и т.д.)
 	for _, spawner := range conf.Routines {
 		go spawner.SpawnRoutine(tun)
 	}
 
-	// Запускаем ICMP пинги
 	tun.StartPingIPs()
 
-	// HTTP-сервер для метрик (если включён)
 	var metricsServer *http.Server
 	if *info != "" {
 		metricsServer = &http.Server{
@@ -277,39 +268,27 @@ func main() {
 		}()
 	}
 
-	// Ожидаем сигнала завершения
+	// wait for signal
 	<-ctx.Done()
-
-	// --- Graceful shutdown: останавливаем все фоновые задачи ---
 	log.Println("Shutting down gracefully...")
 
-	// Создаём контекст с таймаутом для завершения
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
-	// Останавливаем ICMP пинги
 	tun.StopPingIPs()
-
-	// Останавливаем DNS-резолверы для всех SOCKS5-серверов
 	for _, spawner := range conf.Routines {
 		if s5, ok := spawner.(*wireproxyawg.Socks5Config); ok {
 			s5.Stop()
 		}
 	}
-
-	// Останавливаем HTTP-сервер метрик
 	if metricsServer != nil {
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
 		}
 	}
-
-	// Закрываем TUN-устройство и освобождаем ресурсы wireguard
 	if tun.Dev != nil {
 		tun.Dev.Close()
 	}
-
-	// Ждём завершения всех операций или таймаута
 	<-shutdownCtx.Done()
 	log.Println("Shutdown complete")
 }
