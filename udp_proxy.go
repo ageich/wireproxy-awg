@@ -87,22 +87,14 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 
 	var sessionMu sync.Mutex
 
-	closeSessionChan := func(sess *udpSession) {
-		select {
-		case <-sess.closeChan:
-		default:
-			close(sess.closeChan)
-		}
-	}
-
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 		conf.mu.Lock()
 		currentCache := conf.sessions
 		conf.mu.Unlock()
-		if current != nil {
-			if current, ok := currentCache.Get(src); ok && current == sess {
+		if currentCache != nil {
+			if existing, ok := currentCache.Get(src); ok && existing == sess {
 				currentCache.Remove(src)
 			}
 		}
