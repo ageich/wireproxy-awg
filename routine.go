@@ -85,7 +85,7 @@ type fixedResolver struct {
 	systemDNS bool
 	cache     *expirable.LRU[string, net.IP]
 	ttl       time.Duration
-	mu        sync.RWMutex // для защиты доступа к cache
+	mu        sync.RWMutex
 }
 
 // NewFixedResolver creates a new resolver with LRU cache and TTL expiration
@@ -105,13 +105,10 @@ func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.cache == nil || newSize <= 0 {
-		// Если новый размер <= 0 или кэш не создан, просто создаём новый пустой кэш
 		r.cache = expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
 		return
 	}
-	// Создаём новый кэш с новым размером
 	newCache := expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
-	// Копируем все записи из старого кэша
 	for _, key := range r.cache.Keys() {
 		if val, ok := r.cache.Get(key); ok {
 			newCache.Add(key, val)
@@ -266,15 +263,7 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 
 // SpawnRoutine for HTTPConfig
 func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
-	server := &HTTPServer{
-		config: config,
-		dial:   vt.Tnet.Dial,
-		auth:   CredentialValidator{config.Username, config.Password},
-	}
-	if config.Username != "" || config.Password != "" {
-		server.authRequired = true
-	}
-
+	server := NewHTTPServer(config, vt.Tnet.Dial)
 	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
 		log.Fatal(err)
 	}
