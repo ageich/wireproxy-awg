@@ -150,12 +150,14 @@ func (s *HTTPServer) serve(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(conn, peer)
+		// Используем CopyWithPool вместо io.Copy
+		_, _ = CopyWithPool(conn, peer)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(peer, conn)
+		// Используем CopyWithPool вместо io.Copy
+		_, _ = CopyWithPool(peer, conn)
 	}()
 
 	wg.Wait()
