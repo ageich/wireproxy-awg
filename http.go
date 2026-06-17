@@ -3,6 +3,7 @@ package wireproxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -11,17 +12,41 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
 
 type HTTPServer struct {
-	config *HTTPConfig
-
-	auth CredentialValidator
-	dial func(network, address string) (net.Conn, error)
-
+	config     *HTTPConfig
+	auth       CredentialValidator
 	authRequired bool
+	httpClient *http.Client // клиент с пулом соединений для обычных HTTP-запросов
+}
+
+// NewHTTPServer создаёт HTTPServer с настроенным HTTP-клиентом и пулом соединений.
+func NewHTTPServer(config *HTTPConfig, dial func(network, address string) (net.Conn, error)) *HTTPServer {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dial(network, addr)
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	client := &http.Client{
+		Transport: transport,
+		// Не следуем перенаправлениям (прокси не должен этого делать)
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return &HTTPServer{
+		config:       config,
+		auth:         CredentialValidator{config.Username, config.Password},
+		authRequired: config.Username != "" || config.Password != "",
+		httpClient:   client,
+	}
 }
 
 // responseWith создаёт HTTP-ответ с заданным статус-кодом.
@@ -63,16 +88,16 @@ func (s *HTTPServer) authenticate(req *http.Request) (int, error) {
 	return http.StatusUnauthorized, fmt.Errorf("username and password not matching")
 }
 
+// handleConn обрабатывает CONNECT-запросы (установка туннеля)
 func (s *HTTPServer) handleConn(req *http.Request, conn net.Conn) (peer net.Conn, err error) {
 	addr := req.Host
 	if !strings.Contains(addr, ":") {
-		port := "443"
-		addr = net.JoinHostPort(addr, port)
+		addr = net.JoinHostPort(addr, "443")
 	}
 
-	peer, err = s.dial("tcp", addr)
+	peer, err = s.httpClient.Transport.(*http.Transport).DialContext(req.Context(), "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("tun tcp dial failed: %w", err)
+		return nil, fmt.Errorf("tcp dial failed: %w", err)
 	}
 
 	_, err = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
@@ -84,35 +109,37 @@ func (s *HTTPServer) handleConn(req *http.Request, conn net.Conn) (peer net.Conn
 	return peer, nil
 }
 
-func (s *HTTPServer) handle(req *http.Request) (peer net.Conn, err error) {
-	addr := req.Host
-	if !strings.Contains(addr, ":") {
-		port := "80"
-		addr = net.JoinHostPort(addr, port)
-	}
+// handle обрабатывает обычные HTTP-запросы (GET, POST и т.д.) через клиент с пулом соединений.
+func (s *HTTPServer) handle(req *http.Request, conn net.Conn) error {
+	// Удаляем заголовки, специфичные для прокси
+	req.Header.Del("Proxy-Connection")
+	req.Header.Del("Proxy-Authenticate")
 
-	peer, err = s.dial("tcp", addr)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("tun tcp dial failed: %w", err)
+		return fmt.Errorf("http client do failed: %w", err)
 	}
+	defer resp.Body.Close()
 
-	err = req.Write(peer)
-	if err != nil {
-		_ = peer.Close()
-		return nil, fmt.Errorf("conn write failed: %w", err)
+	// Удаляем лишние заголовки прокси
+	resp.Header.Del("Proxy-Connection")
+	resp.Header.Del("Proxy-Authenticate")
+
+	// Записываем ответ клиенту
+	if err := resp.Write(conn); err != nil {
+		return fmt.Errorf("write response failed: %w", err)
 	}
-
-	return peer, nil
+	return nil
 }
 
+// serve обрабатывает одно клиентское соединение.
 func (s *HTTPServer) serve(conn net.Conn) {
-	// Гарантированно закрываем клиентское соединение при выходе
 	defer conn.Close()
 
-	var rd = bufio.NewReader(conn)
+	rd := bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
 	if err != nil {
-		log.Printf("read request failed: %s\n", err)
+		log.Printf("read request failed: %v", err)
 		return
 	}
 
@@ -127,68 +154,53 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		return
 	}
 
-	var peer net.Conn
 	switch req.Method {
 	case http.MethodConnect:
-		peer, err = s.handleConn(req, conn)
-	case http.MethodGet:
-		peer, err = s.handle(req)
+		peer, err := s.handleConn(req, conn)
+		if err != nil {
+			log.Printf("CONNECT failed: %v", err)
+			if peer != nil {
+				_ = peer.Close()
+			}
+			return
+		}
+		defer peer.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = CopyWithPool(conn, peer)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = CopyWithPool(peer, conn)
+		}()
+		wg.Wait()
+
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodPatch, http.MethodOptions:
+		err = s.handle(req, conn)
+		if err != nil {
+			log.Printf("HTTP request failed: %v", err)
+		}
 	default:
 		_ = responseWith(req, http.StatusMethodNotAllowed).Write(conn)
-		log.Printf("unsupported protocol: %s\n", req.Method)
-		return
+		log.Printf("unsupported method: %s", req.Method)
 	}
-	if err != nil {
-		log.Printf("dial proxy failed: %s\n", err)
-		if peer != nil {
-			_ = peer.Close()
-		}
-		return
-	}
-	if peer == nil {
-		log.Println("dial proxy failed: peer nil")
-		return
-	}
-	// Гарантируем закрытие peer при любом выходе из serve после успешного подключения
-	defer func() {
-		if peer != nil {
-			_ = peer.Close()
-		}
-	}()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		_, _ = CopyWithPool(conn, peer)
-	}()
-
-	go func() {
-		defer wg.Done()
-		_, _ = CopyWithPool(peer, conn)
-	}()
-
-	wg.Wait()
-	// conn закроется через defer, peer закроется через defer
 }
 
-// ListenAndServe is used to create a listener and serve on it
+// ListenAndServe запускает TCP-сервер.
 func (s *HTTPServer) ListenAndServe(network, addr string) error {
-	server, err := net.Listen(network, addr)
+	listener, err := net.Listen(network, addr)
 	if err != nil {
-		return fmt.Errorf("listen tcp failed: %w", err)
+		return fmt.Errorf("listen failed: %w", err)
 	}
-	defer func(server net.Listener) {
-		_ = server.Close()
-	}(server)
+	defer listener.Close()
 	for {
-		conn, err := server.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("accept request failed: %w", err)
+			return fmt.Errorf("accept failed: %w", err)
 		}
-		go func(conn net.Conn) {
-			s.serve(conn)
-		}(conn)
+		go s.serve(conn)
 	}
 }
