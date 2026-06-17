@@ -9,21 +9,21 @@ import (
 )
 
 type ASecConfigType struct {
-	junkPacketCount               int    // Jc
-	junkPacketMinSize             int    // Jmin
-	junkPacketMaxSize             int    // Jmax
-	initPacketJunkSize            int    // s1
-	responsePacketJunkSize        int    // s2
-	cookieReplyPacketJunkSize     int    // s3
-	transportPacketJunkSize       int    // s4
-	initPacketMagicHeader         uint32 // h1
-	initPacketMagicHeaderMax      uint32 // h1 upper bound
-	responsePacketMagicHeader     uint32 // h2
-	responsePacketMagicHeaderMax  uint32 // h2 upper bound
-	underloadPacketMagicHeader    uint32 // h3
-	underloadPacketMagicHeaderMax uint32 // h3 upper bound
-	transportPacketMagicHeader    uint32 // h4
-	transportPacketMagicHeaderMax uint32 // h4 upper bound
+	junkPacketCount               int
+	junkPacketMinSize             int
+	junkPacketMaxSize             int
+	initPacketJunkSize            int
+	responsePacketJunkSize        int
+	cookieReplyPacketJunkSize     int
+	transportPacketJunkSize       int
+	initPacketMagicHeader         uint32
+	initPacketMagicHeaderMax      uint32
+	responsePacketMagicHeader     uint32
+	responsePacketMagicHeaderMax  uint32
+	underloadPacketMagicHeader    uint32
+	underloadPacketMagicHeaderMax uint32
+	transportPacketMagicHeader    uint32
+	transportPacketMagicHeaderMax uint32
 	hasJunkPacketCount            bool
 	hasJunkPacketMinSize          bool
 	hasJunkPacketMaxSize          bool
@@ -42,192 +42,169 @@ type ASecConfigType struct {
 	i5                            *string
 }
 
+// parseIntField парсит целочисленное поле и устанавливает флаг наличия.
+func parseIntField(section *ini.Section, keyName string, config **ASecConfigType, setter func(*ASecConfigType, int), flagSetter func(*ASecConfigType, bool)) error {
+	key, err := section.GetKey(keyName)
+	if err != nil {
+		return nil // ключ отсутствует — не ошибка
+	}
+	value, err := key.Int()
+	if err != nil {
+		return err
+	}
+	if *config == nil {
+		*config = &ASecConfigType{}
+	}
+	setter(*config, value)
+	flagSetter(*config, true)
+	return nil
+}
+
+// parseMagicHeaderField парсит поле магического заголовка (интервал) и устанавливает флаг.
+func parseMagicHeaderField(section *ini.Section, keyName string, config **ASecConfigType,
+	minSetter func(*ASecConfigType, uint32), maxSetter func(*ASecConfigType, uint32), flagSetter func(*ASecConfigType, bool)) error {
+	key, err := section.GetKey(keyName)
+	if err != nil {
+		return nil // ключ отсутствует — не ошибка
+	}
+	minVal, maxVal, err := parseMagicHeaderInterval(key.String())
+	if err != nil {
+		return err
+	}
+	if *config == nil {
+		*config = &ASecConfigType{}
+	}
+	minSetter(*config, minVal)
+	maxSetter(*config, maxVal)
+	flagSetter(*config, true)
+	return nil
+}
+
+// parseStringField парсит строковое поле и сохраняет указатель.
+func parseStringField(section *ini.Section, keyName string, config **ASecConfigType, setter func(*ASecConfigType, *string)) error {
+	key, err := section.GetKey(keyName)
+	if err != nil {
+		return nil // ключ отсутствует — не ошибка
+	}
+	value := key.String()
+	if *config == nil {
+		*config = &ASecConfigType{}
+	}
+	setter(*config, &value)
+	return nil
+}
+
+// ParseASecConfig загружает и валидирует секцию AmneziaWG.
 func ParseASecConfig(section *ini.Section) (*ASecConfigType, error) {
-	var aSecConfig *ASecConfigType
+	var config *ASecConfigType
 
-	if sectionKey, err := section.GetKey("Jc"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.junkPacketCount = value
-		aSecConfig.hasJunkPacketCount = true
-	}
-
-	if sectionKey, err := section.GetKey("Jmin"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.junkPacketMinSize = value
-		aSecConfig.hasJunkPacketMinSize = true
-	}
-
-	if sectionKey, err := section.GetKey("Jmax"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.junkPacketMaxSize = value
-		aSecConfig.hasJunkPacketMaxSize = true
-	}
-
-	if sectionKey, err := section.GetKey("S1"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.initPacketJunkSize = value
-		aSecConfig.hasInitPacketJunkSize = true
-	}
-
-	if sectionKey, err := section.GetKey("S2"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.responsePacketJunkSize = value
-		aSecConfig.hasResponsePacketJunkSize = true
-	}
-
-	if sectionKey, err := section.GetKey("S3"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.cookieReplyPacketJunkSize = value
-		aSecConfig.hasCookieReplyPacketJunkSize = true
-	}
-
-	if sectionKey, err := section.GetKey("S4"); err == nil {
-		value, err := sectionKey.Int()
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.transportPacketJunkSize = value
-		aSecConfig.hasTransportPacketJunkSize = true
-	}
-
-	if sectionKey, err := section.GetKey("H1"); err == nil {
-		minValue, maxValue, err := parseMagicHeaderInterval(sectionKey.String())
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.initPacketMagicHeader = minValue
-		aSecConfig.initPacketMagicHeaderMax = maxValue
-		aSecConfig.hasInitPacketMagicHeader = true
-	}
-
-	if sectionKey, err := section.GetKey("H2"); err == nil {
-		minValue, maxValue, err := parseMagicHeaderInterval(sectionKey.String())
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.responsePacketMagicHeader = minValue
-		aSecConfig.responsePacketMagicHeaderMax = maxValue
-		aSecConfig.hasResponsePacketMagicHeader = true
-	}
-
-	if sectionKey, err := section.GetKey("H3"); err == nil {
-		minValue, maxValue, err := parseMagicHeaderInterval(sectionKey.String())
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.underloadPacketMagicHeader = minValue
-		aSecConfig.underloadPacketMagicHeaderMax = maxValue
-		aSecConfig.hasUnderloadPacketMagicHeader = true
-	}
-
-	if sectionKey, err := section.GetKey("H4"); err == nil {
-		minValue, maxValue, err := parseMagicHeaderInterval(sectionKey.String())
-		if err != nil {
-			return nil, err
-		}
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.transportPacketMagicHeader = minValue
-		aSecConfig.transportPacketMagicHeaderMax = maxValue
-		aSecConfig.hasTransportPacketMagicHeader = true
-	}
-
-	if sectionKey, err := section.GetKey("I1"); err == nil {
-		value := sectionKey.String()
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.i1 = &value
-	}
-
-	if sectionKey, err := section.GetKey("I2"); err == nil {
-		value := sectionKey.String()
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.i2 = &value
-	}
-
-	if sectionKey, err := section.GetKey("I3"); err == nil {
-		value := sectionKey.String()
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.i3 = &value
-	}
-
-	if sectionKey, err := section.GetKey("I4"); err == nil {
-		value := sectionKey.String()
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.i4 = &value
-	}
-
-	if sectionKey, err := section.GetKey("I5"); err == nil {
-		value := sectionKey.String()
-		if aSecConfig == nil {
-			aSecConfig = &ASecConfigType{}
-		}
-		aSecConfig.i5 = &value
-	}
-
-	if err := ValidateASecConfig(aSecConfig); err != nil {
+	// Целочисленные поля
+	if err := parseIntField(section, "Jc", &config,
+		func(c *ASecConfigType, v int) { c.junkPacketCount = v },
+		func(c *ASecConfigType, b bool) { c.hasJunkPacketCount = b },
+	); err != nil {
 		return nil, err
 	}
 
-	return aSecConfig, nil
+	if err := parseIntField(section, "Jmin", &config,
+		func(c *ASecConfigType, v int) { c.junkPacketMinSize = v },
+		func(c *ASecConfigType, b bool) { c.hasJunkPacketMinSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseIntField(section, "Jmax", &config,
+		func(c *ASecConfigType, v int) { c.junkPacketMaxSize = v },
+		func(c *ASecConfigType, b bool) { c.hasJunkPacketMaxSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseIntField(section, "S1", &config,
+		func(c *ASecConfigType, v int) { c.initPacketJunkSize = v },
+		func(c *ASecConfigType, b bool) { c.hasInitPacketJunkSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseIntField(section, "S2", &config,
+		func(c *ASecConfigType, v int) { c.responsePacketJunkSize = v },
+		func(c *ASecConfigType, b bool) { c.hasResponsePacketJunkSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseIntField(section, "S3", &config,
+		func(c *ASecConfigType, v int) { c.cookieReplyPacketJunkSize = v },
+		func(c *ASecConfigType, b bool) { c.hasCookieReplyPacketJunkSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseIntField(section, "S4", &config,
+		func(c *ASecConfigType, v int) { c.transportPacketJunkSize = v },
+		func(c *ASecConfigType, b bool) { c.hasTransportPacketJunkSize = b },
+	); err != nil {
+		return nil, err
+	}
+
+	// Поля магических заголовков (интервалы)
+	if err := parseMagicHeaderField(section, "H1", &config,
+		func(c *ASecConfigType, v uint32) { c.initPacketMagicHeader = v },
+		func(c *ASecConfigType, v uint32) { c.initPacketMagicHeaderMax = v },
+		func(c *ASecConfigType, b bool) { c.hasInitPacketMagicHeader = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseMagicHeaderField(section, "H2", &config,
+		func(c *ASecConfigType, v uint32) { c.responsePacketMagicHeader = v },
+		func(c *ASecConfigType, v uint32) { c.responsePacketMagicHeaderMax = v },
+		func(c *ASecConfigType, b bool) { c.hasResponsePacketMagicHeader = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseMagicHeaderField(section, "H3", &config,
+		func(c *ASecConfigType, v uint32) { c.underloadPacketMagicHeader = v },
+		func(c *ASecConfigType, v uint32) { c.underloadPacketMagicHeaderMax = v },
+		func(c *ASecConfigType, b bool) { c.hasUnderloadPacketMagicHeader = b },
+	); err != nil {
+		return nil, err
+	}
+
+	if err := parseMagicHeaderField(section, "H4", &config,
+		func(c *ASecConfigType, v uint32) { c.transportPacketMagicHeader = v },
+		func(c *ASecConfigType, v uint32) { c.transportPacketMagicHeaderMax = v },
+		func(c *ASecConfigType, b bool) { c.hasTransportPacketMagicHeader = b },
+	); err != nil {
+		return nil, err
+	}
+
+	// Строковые поля (I1-I5)
+	if err := parseStringField(section, "I1", &config, func(c *ASecConfigType, v *string) { c.i1 = v }); err != nil {
+		return nil, err
+	}
+	if err := parseStringField(section, "I2", &config, func(c *ASecConfigType, v *string) { c.i2 = v }); err != nil {
+		return nil, err
+	}
+	if err := parseStringField(section, "I3", &config, func(c *ASecConfigType, v *string) { c.i3 = v }); err != nil {
+		return nil, err
+	}
+	if err := parseStringField(section, "I4", &config, func(c *ASecConfigType, v *string) { c.i4 = v }); err != nil {
+		return nil, err
+	}
+	if err := parseStringField(section, "I5", &config, func(c *ASecConfigType, v *string) { c.i5 = v }); err != nil {
+		return nil, err
+	}
+
+	if err := ValidateASecConfig(config); err != nil {
+		return nil, err
+	}
+	return config, nil
 }
 
+// ValidateASecConfig — без изменений (оставлен как был).
 func ValidateASecConfig(config *ASecConfigType) error {
 	if config == nil {
 		return nil
@@ -243,10 +220,12 @@ func ValidateASecConfig(config *ASecConfigType) error {
 		return errors.New("value of the Jmax field must be less than or equal 1280")
 	}
 
-	const messageInitiationSize = 148
-	const messageResponseSize = 92
-	const messageCookieReplySize = 64
-	const messageTransportSize = 32
+	const (
+		messageInitiationSize = 148
+		messageResponseSize   = 92
+		messageCookieReplySize = 64
+		messageTransportSize  = 32
+	)
 
 	type packetSizeCheck struct {
 		isSet bool
@@ -289,7 +268,6 @@ func ValidateASecConfig(config *ASecConfigType) error {
 	if hasOverlappingHeaderIntervals(intervals) {
 		return errors.New("values of the H1-H4 fields must be unique")
 	}
-
 	return nil
 }
 
@@ -306,30 +284,27 @@ const (
 	defaultTransportPacketMagicHeader uint32 = 4
 )
 
+// parseMagicHeaderInterval — без изменений.
 func parseMagicHeaderInterval(value string) (uint32, uint32, error) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return 0, 0, errors.New("empty magic header value")
 	}
-
 	parts := strings.Split(trimmed, "-")
 	if len(parts) == 0 || len(parts) > 2 || parts[0] == "" {
 		return 0, 0, errors.New("invalid magic header range format")
 	}
-
 	minRaw, err := strconv.ParseUint(parts[0], 10, 32)
 	if err != nil {
 		return 0, 0, err
 	}
 	minValue := uint32(minRaw)
-
 	if len(parts) == 1 {
 		return minValue, minValue, nil
 	}
 	if parts[1] == "" {
 		return 0, 0, errors.New("invalid magic header range format")
 	}
-
 	maxRaw, err := strconv.ParseUint(parts[1], 10, 32)
 	if err != nil {
 		return 0, 0, err
@@ -338,10 +313,10 @@ func parseMagicHeaderInterval(value string) (uint32, uint32, error) {
 	if minValue > maxValue {
 		return 0, 0, errors.New("invalid magic header range: lower bound cannot exceed upper bound")
 	}
-
 	return minValue, maxValue, nil
 }
 
+// collectEffectiveHeaderIntervals и hasOverlappingHeaderIntervals — без изменений.
 func collectEffectiveHeaderIntervals(config *ASecConfigType) []headerInterval {
 	intervals := make([]headerInterval, 0, 4)
 
@@ -385,6 +360,7 @@ func hasOverlappingHeaderIntervals(intervals []headerInterval) bool {
 	return false
 }
 
+// formatMagicHeaderInterval — без изменений.
 func formatMagicHeaderInterval(minValue uint32, maxValue uint32) string {
 	if minValue == maxValue {
 		return strconv.FormatUint(uint64(minValue), 10)
