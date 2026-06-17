@@ -83,7 +83,9 @@ type addressPort struct {
 type fixedResolver struct {
 	tnet      *netstack.Net
 	systemDNS bool
-	Cache     *expirable.LRU[string, net.IP] // экспортируемое поле для тестов
+	cache     *expirable.LRU[string, net.IP]
+	ttl       time.Duration
+	mu        sync.RWMutex // для защиты доступа к cache
 }
 
 // NewFixedResolver creates a new resolver with LRU cache and TTL expiration
@@ -92,13 +94,39 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cac
 	return &fixedResolver{
 		tnet:      tnet,
 		systemDNS: systemDNS,
-		Cache:     cache,
+		cache:     cache,
+		ttl:       ttl,
 	}
+}
+
+// SetCacheSize изменяет размер кэша, создавая новый кэш с новым размером
+// и копируя существующие записи из старого кэша (если они есть).
+func (r *fixedResolver) SetCacheSize(newSize int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cache == nil || newSize <= 0 {
+		// Если новый размер <= 0 или кэш не создан, просто создаём новый пустой кэш
+		r.cache = expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
+		return
+	}
+	// Создаём новый кэш с новым размером
+	newCache := expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
+	// Копируем все записи из старого кэша
+	for _, key := range r.cache.Keys() {
+		if val, ok := r.cache.Get(key); ok {
+			newCache.Add(key, val)
+		}
+	}
+	r.cache = newCache
 }
 
 // Resolve implements socks5.NameResolver
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	if ip, ok := r.Cache.Get(name); ok {
+	r.mu.RLock()
+	cache := r.cache
+	r.mu.RUnlock()
+
+	if ip, ok := cache.Get(name); ok {
 		return ctx, ip, nil
 	}
 
@@ -120,11 +148,13 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 		}
 	}
 
-	r.Cache.Add(name, ip)
+	r.mu.Lock()
+	r.cache.Add(name, ip)
+	r.mu.Unlock()
 	return ctx, ip, nil
 }
 
-// Stop is a no-op for compatibility (cleanup is handled automatically by expirable.LRU)
+// Stop is a no-op for compatibility
 func (r *fixedResolver) Stop() {
 	// Nothing to do
 }
@@ -303,6 +333,11 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 }
 
+// SpawnRoutine for UDPProxyTunnelConfig
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+	conf.SpawnUDPProxy(vt)
+}
+
 // connForward copy data from `from` to `to`
 func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 	defer func() { _ = from.Close() }()
@@ -342,7 +377,6 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 		return
 	}
 
-	// os.Stdout has previously been remapped to stderr, so we can't use it
 	stdout, err := os.OpenFile("/dev/stdout", os.O_WRONLY, 0)
 	if err != nil {
 		errorLogger.Printf("Failed to open /dev/stdout: %s\n", err.Error())
