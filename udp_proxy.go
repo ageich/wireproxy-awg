@@ -18,9 +18,43 @@ type udpSession struct {
 	inactivityDur time.Duration
 }
 
-// SpawnRoutine реализует интерфейс RoutineSpawner.
-// Запускает UDP-прокси с ограниченным LRU-кэшем сессий.
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+// UDPProxyTunnelConfig расширена для поддержки динамического изменения размера
+type UDPProxyTunnelConfig struct {
+	BindAddress       string
+	Target            string
+	InactivityTimeout int
+	// для динамического изменения
+	sessions *lru.Cache[string, *udpSession]
+	mu       sync.Mutex
+}
+
+// SetCacheSize изменяет размер кэша сессий.
+func (conf *UDPProxyTunnelConfig) SetCacheSize(newSize int) error {
+	conf.mu.Lock()
+	defer conf.mu.Unlock()
+	if conf.sessions == nil {
+		return nil // ещё не создан
+	}
+	// Создаём новый кэш с новым размером и таким же evict-колбэком
+	newCache, err := lru.NewWithEvict[string, *udpSession](newSize, func(key string, sess *udpSession) {
+		_ = sess.remoteConn.Close()
+		select {
+		case <-sess.closeChan:
+		default:
+			close(sess.closeChan)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	// Заменяем старый кэш новым. Старые сессии продолжат жить до таймаута.
+	conf.sessions = newCache
+	return nil
+}
+
+// SpawnUDPProxy реализует основную логику UDP-прокси.
+// Вынесена из SpawnRoutine для возможности переиспользования.
+func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(vt *VirtualTun) {
 	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
 	if err != nil {
 		log.Fatalf("UDPProxyTunnelConfig: could not resolve bind address %s: %v", conf.BindAddress, err)
@@ -39,6 +73,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 	inactivityDur := time.Duration(conf.InactivityTimeout) * time.Second
 
+	// Создаём LRU-кэш и сохраняем в конфиг
 	sessions, err := lru.NewWithEvict[string, *udpSession](cacheSize,
 		func(key string, sess *udpSession) {
 			_ = sess.remoteConn.Close()
@@ -51,6 +86,9 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	if err != nil {
 		log.Fatalf("UDPProxyTunnel: failed to create LRU cache: %v", err)
 	}
+	conf.mu.Lock()
+	conf.sessions = sessions
+	conf.mu.Unlock()
 
 	var sessionMu sync.Mutex
 
@@ -65,8 +103,12 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
-		if current, ok := sessions.Get(src); ok && current == sess {
-			sessions.Remove(src)
+		// Используем актуальный кэш из конфига
+		conf.mu.Lock()
+		currentCache := conf.sessions
+		conf.mu.Unlock()
+		if current, ok := currentCache.Get(src); ok && current == sess {
+			currentCache.Remove(src)
 		}
 	}
 
@@ -77,11 +119,16 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 			for range ticker.C {
 				now := time.Now()
 				sessionMu.Lock()
-				for _, key := range sessions.Keys() {
-					if sess, ok := sessions.Get(key); ok {
-						if now.Sub(sess.lastActive) >= inactivityDur {
-							log.Printf("UDPProxyTunnel: closing inactive session for %s", key)
-							sessions.Remove(key)
+				conf.mu.Lock()
+				currentCache := conf.sessions
+				conf.mu.Unlock()
+				if currentCache != nil {
+					for _, key := range currentCache.Keys() {
+						if sess, ok := currentCache.Get(key); ok {
+							if now.Sub(sess.lastActive) >= inactivityDur {
+								log.Printf("UDPProxyTunnel: closing inactive session for %s", key)
+								currentCache.Remove(key)
+							}
 						}
 					}
 				}
@@ -94,7 +141,11 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 
-		if s, ok := sessions.Get(srcAddr); ok {
+		conf.mu.Lock()
+		currentCache := conf.sessions
+		conf.mu.Unlock()
+
+		if s, ok := currentCache.Get(srcAddr); ok {
 			s.lastActive = time.Now()
 			return s, nil
 		}
@@ -110,7 +161,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 			closeChan:     make(chan struct{}),
 			inactivityDur: inactivityDur,
 		}
-		sessions.Add(srcAddr, s)
+		currentCache.Add(srcAddr, s)
 
 		go conf.handleRemoteToLocal(listener, srcAddr, s, removeSession)
 		return s, nil
@@ -118,7 +169,6 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 
 	go func() {
 		for {
-			// Получаем буфер из пула
 			buf := GetBuffer()
 			n, src, err := listener.ReadFromUDP(buf)
 			if err != nil {
@@ -140,10 +190,14 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 			if err != nil {
 				errorLogger.Printf("UDPProxyTunnel: could not write to remote (%s): %v", conf.Target, err)
 			}
-			// Возвращаем буфер в пул
 			PutBuffer(buf)
 		}
 	}()
+}
+
+// SpawnRoutine реализует интерфейс RoutineSpawner
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+	conf.SpawnUDPProxy(vt)
 }
 
 // handleRemoteToLocal читает данные из удалённого соединения и отправляет их обратно локальному клиенту
@@ -153,9 +207,8 @@ func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(listener *net.UDPConn, src
 		_ = s.remoteConn.Close()
 	}()
 
-	// Получаем буфер один раз для этой горутины и переиспользуем его в цикле
 	buf := GetBuffer()
-	defer PutBuffer(buf) // вернём при выходе из горутины
+	defer PutBuffer(buf)
 
 	for {
 		select {
