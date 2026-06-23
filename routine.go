@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -68,8 +69,9 @@ type VirtualTun struct {
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
+// Теперь возвращает ошибку.
 type RoutineSpawner interface {
-	SpawnRoutine(ctx context.Context, vt *VirtualTun)
+	SpawnRoutine(ctx context.Context, vt *VirtualTun) error
 }
 
 type addressPort struct {
@@ -239,10 +241,10 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
-// ---------- SpawnRoutine implementations ----------
+// ---------- SpawnRoutine implementations (теперь возвращают ошибку) ----------
 
 // SpawnRoutine for Socks5Config
-func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, vt.DnsCacheSize)
 	config.resolver = resolver
 
@@ -264,10 +266,9 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 
 	server := socks5.NewServer(options...)
 
-	// Создаём listener вручную, чтобы управлять его закрытием
 	listener, err := net.Listen("tcp", config.BindAddress)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to listen on %s: %w", config.BindAddress, err)
 	}
 	defer listener.Close()
 
@@ -276,36 +277,42 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 		listener.Close()
 	}()
 
-	// Запускаем сервер с нашим listener
 	if err := server.Serve(listener); err != nil {
 		select {
 		case <-ctx.Done():
 			// нормальное завершение
-			return
+			return nil
 		default:
-			log.Fatal(err)
+			return fmt.Errorf("SOCKS5 server error: %w", err)
 		}
 	}
+	return nil
 }
 
 // SpawnRoutine for HTTPConfig
-func (config *HTTPConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+func (config *HTTPConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	server := NewHTTPServer(config, vt.Tnet.Dial)
 	if err := server.ListenAndServe(ctx, "tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			return fmt.Errorf("HTTP server error: %w", err)
+		}
 	}
+	return nil
 }
 
 // SpawnRoutine for TCPClientTunnelConfig
-func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("parse target %s: %w", conf.Target, err)
 	}
 
 	server, err := net.ListenTCP("tcp", conf.BindAddress)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("listen on %s: %w", conf.BindAddress, err)
 	}
 	defer server.Close()
 
@@ -319,9 +326,9 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			default:
-				log.Fatal(err)
+				return fmt.Errorf("accept error: %w", err)
 			}
 		}
 		go tcpClientForward(ctx, vt, raddr, conn)
@@ -329,26 +336,27 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 }
 
 // SpawnRoutine for STDIOTunnelConfig
-func (conf *STDIOTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+func (conf *STDIOTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("parse target %s: %w", conf.Target, err)
 	}
 
 	go STDIOTcpForward(ctx, vt, raddr)
+	return nil
 }
 
 // SpawnRoutine for TCPServerTunnelConfig
-func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("parse target %s: %w", conf.Target, err)
 	}
 
 	addr := &net.TCPAddr{Port: conf.ListenPort}
 	server, err := vt.Tnet.ListenTCP(addr)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("listen on wireguard port %d: %w", conf.ListenPort, err)
 	}
 	defer server.Close()
 
@@ -362,9 +370,9 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			default:
-				log.Fatal(err)
+				return fmt.Errorf("accept error: %w", err)
 			}
 		}
 		go tcpServerForward(ctx, vt, raddr, conn)
@@ -372,8 +380,8 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 }
 
 // SpawnRoutine for UDPProxyTunnelConfig
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
-	conf.SpawnUDPProxy(ctx, vt)
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
+	return conf.SpawnUDPProxy(ctx, vt)
 }
 
 // connForward copy data from `from` to `to`
