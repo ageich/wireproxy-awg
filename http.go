@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const idleTimeout = 5 * time.Minute // таймаут бездействия для TCP-соединений
+
 const proxyAuthHeaderKey = "Proxy-Authorization"
 
 type HTTPServer struct {
@@ -145,6 +147,11 @@ func (s *HTTPServer) serve(conn net.Conn) {
 			return
 		}
 		defer peer.Close()
+
+		// Устанавливаем таймаут на чтение для туннельных соединений
+		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		_ = peer.SetReadDeadline(time.Now().Add(idleTimeout))
+
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
