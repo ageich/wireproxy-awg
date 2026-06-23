@@ -35,7 +35,7 @@ func NewHTTPServer(config *HTTPConfig, dial func(network, address string) (net.C
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   httpTimeout, // общий таймаут на выполнение запроса
+		Timeout:   httpTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -149,7 +149,6 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		}
 		defer peer.Close()
 
-		// Устанавливаем таймаут на чтение для туннельных соединений
 		// idleTimeout объявлен в routine.go
 		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		_ = peer.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -198,7 +197,7 @@ func (s *HTTPServer) ListenAndServe(ctx context.Context, network, addr string) e
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				return nil // нормальное завершение
+				return nil
 			default:
 				return fmt.Errorf("accept failed: %w", err)
 			}
