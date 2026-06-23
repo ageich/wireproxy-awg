@@ -166,16 +166,29 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	}
 }
 
-func (s *HTTPServer) ListenAndServe(network, addr string) error {
+// ListenAndServe запускает HTTP-прокси с поддержкой graceful shutdown через контекст.
+func (s *HTTPServer) ListenAndServe(ctx context.Context, network, addr string) error {
 	listener, err := net.Listen(network, addr)
 	if err != nil {
 		return fmt.Errorf("listen failed: %w", err)
 	}
 	defer listener.Close()
+
+	// Закрываем слушатель при отмене контекста
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("accept failed: %w", err)
+			select {
+			case <-ctx.Done():
+				return nil // нормальное завершение
+			default:
+				return fmt.Errorf("accept failed: %w", err)
+			}
 		}
 		go s.serve(conn)
 	}
