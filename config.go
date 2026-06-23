@@ -305,6 +305,7 @@ func ParseInterface(cfg *ini.File, device *DeviceConfig) error {
 		device.CheckAliveInterval = value
 	}
 
+	// Валидация AmneziaWG параметров выполняется внутри ParseASecConfig
 	aSecConfig, err := ParseASecConfig(section)
 	if err != nil {
 		return err
@@ -446,7 +447,6 @@ func parseResolveConfig(section *ini.Section) (*ResolveConfig, error) {
 	return config, nil
 }
 
-// parseUDPProxyTunnelConfig – определён ниже (использует тип из udp_proxy.go)
 func parseUDPProxyTunnelConfig(section *ini.Section) (RoutineSpawner, error) {
 	config := &UDPProxyTunnelConfig{}
 	bindAddress, err := parseString(section, "BindAddress")
@@ -564,13 +564,11 @@ func ParseConfig(path string) (*Configuration, error) {
 		Device:   device,
 		Routines: routinesSpawners,
 		Resolve:  resolve,
-		// Значения по умолчанию для размеров кэшей (могут быть переопределены через секцию [Cache])
 		DnsCacheSize:        1000,
 		PingCacheSize:       500,
 		UdpSessionCacheSize: 500,
 	}
 
-	// Чтение секции [Cache] для переопределения размеров кэшей
 	if cacheSection, err := cfg.GetSection("Cache"); err == nil {
 		if key, err := cacheSection.GetKey("DnsCacheSize"); err == nil {
 			if val, err := key.Int(); err == nil && val > 0 {
