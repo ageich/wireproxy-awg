@@ -161,10 +161,13 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
 }
 
 func main() {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	// Создаём контекст с отменой для graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Канал для сигналов
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
 
 	exePath := executablePath()
 	if err := lock("boot"); err != nil {
@@ -266,8 +269,9 @@ func main() {
 	tun.DnsCacheSize = conf.DnsCacheSize
 	tun.UdpSessionCacheSize = conf.UdpSessionCacheSize
 
+	// Запускаем все туннели с контекстом
 	for _, spawner := range conf.Routines {
-		go spawner.SpawnRoutine(tun)
+		go spawner.SpawnRoutine(ctx, tun)
 	}
 
 	tun.StartPingIPs()
@@ -293,12 +297,9 @@ func main() {
 		}
 	}
 
-	// Обработка сигналов
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
-
+	// Единый обработчик сигналов
 	go func() {
-		for sig := range signalChan {
+		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
 				log.Println("Received SIGHUP, reloading configuration...")
@@ -312,38 +313,48 @@ func main() {
 						log.Printf("Reload failed for %T: %v", rl, err)
 					}
 				}
-				// Обновляем глобальные размеры кэшей в tun (если они используются)
+				// Обновляем глобальные размеры кэшей в tun
 				tun.DnsCacheSize = newConf.DnsCacheSize
 				tun.UdpSessionCacheSize = newConf.UdpSessionCacheSize
 				log.Println("Configuration reloaded successfully")
 			default:
+				// SIGINT, SIGTERM, SIGQUIT — отменяем контекст
 				cancel()
 				return
 			}
 		}
 	}()
 
-	// wait for signal
+	// Ожидаем отмены контекста (сигнал завершения)
 	<-ctx.Done()
 	log.Println("Shutting down gracefully...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
+	// Останавливаем пинги
 	tun.StopPingIPs()
+
+	// Останавливаем SOCKS5 резолверы
 	for _, spawner := range conf.Routines {
 		if s5, ok := spawner.(*wireproxyawg.Socks5Config); ok {
 			s5.Stop()
 		}
 	}
+
+	// Останавливаем HTTP сервер метрик
 	if metricsServer != nil {
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
 		}
 	}
+
+	// Закрываем TUN устройство
 	if tun.Dev != nil {
 		tun.Dev.Close()
 	}
+
+	// Ждём завершения shutdown
 	<-shutdownCtx.Done()
 	log.Println("Shutdown complete")
 }
