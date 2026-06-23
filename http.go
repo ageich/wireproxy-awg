@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-const idleTimeout = 5 * time.Minute // таймаут бездействия для TCP-соединений
+const idleTimeout = 5 * time.Minute   // таймаут бездействия для TCP-соединений
+const httpTimeout = 30 * time.Second  // общий таймаут для HTTP-запросов
 
 const proxyAuthHeaderKey = "Proxy-Authorization"
 
@@ -35,6 +36,7 @@ func NewHTTPServer(config *HTTPConfig, dial func(network, address string) (net.C
 	}
 	client := &http.Client{
 		Transport: transport,
+		Timeout:   httpTimeout, // общий таймаут на выполнение запроса
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
