@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -120,7 +119,7 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	rd := bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
 	if err != nil {
-		log.Printf("read request failed: %v", err)
+		errorLogger.Printf("read request failed: %v", err)
 		return
 	}
 	code, err := s.authenticate(req)
@@ -129,15 +128,17 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		if code == http.StatusProxyAuthRequired {
 			resp.Header.Set("Proxy-Authenticate", "Basic realm=\"Proxy\"")
 		}
-		_ = resp.Write(conn)
-		log.Println(err)
+		if writeErr := resp.Write(conn); writeErr != nil {
+			errorLogger.Printf("write auth response failed: %v", writeErr)
+		}
+		errorLogger.Println(err)
 		return
 	}
 	switch req.Method {
 	case http.MethodConnect:
 		peer, err := s.handleConn(req, conn)
 		if err != nil {
-			log.Printf("CONNECT failed: %v", err)
+			errorLogger.Printf("CONNECT failed: %v", err)
 			if peer != nil {
 				_ = peer.Close()
 			}
@@ -158,11 +159,14 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodPatch, http.MethodOptions:
 		err = s.handle(req, conn)
 		if err != nil {
-			log.Printf("HTTP request failed: %v", err)
+			errorLogger.Printf("HTTP request failed: %v", err)
 		}
 	default:
-		_ = responseWith(req, http.StatusMethodNotAllowed).Write(conn)
-		log.Printf("unsupported method: %s", req.Method)
+		resp := responseWith(req, http.StatusMethodNotAllowed)
+		if writeErr := resp.Write(conn); writeErr != nil {
+			errorLogger.Printf("write method not allowed response failed: %v", writeErr)
+		}
+		errorLogger.Printf("unsupported method: %s", req.Method)
 	}
 }
 
