@@ -69,7 +69,7 @@ type VirtualTun struct {
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
 type RoutineSpawner interface {
-	SpawnRoutine(vt *VirtualTun)
+	SpawnRoutine(ctx context.Context, vt *VirtualTun)
 }
 
 type addressPort struct {
@@ -242,7 +242,7 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 // ---------- SpawnRoutine implementations ----------
 
 // SpawnRoutine for Socks5Config
-func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
+func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, vt.DnsCacheSize)
 	config.resolver = resolver
 
@@ -264,21 +264,33 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 
 	server := socks5.NewServer(options...)
 
-	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
-	}
+	// Запускаем сервер в отдельной горутине, чтобы можно было закрыть его при ctx.Done()
+	go func() {
+		if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	// Ждём отмены контекста (сервер не поддерживает graceful shutdown, поэтому просто завершаем горутину)
+	<-ctx.Done()
+	// Принудительно закрываем соединения (нет метода Close, поэтому просто выходим)
+	// В реальности нужно доработать socks5 для graceful shutdown
 }
 
 // SpawnRoutine for HTTPConfig
-func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
+func (config *HTTPConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 	server := NewHTTPServer(config, vt.Tnet.Dial)
-	if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
-		log.Fatal(err)
-	}
+	// Запускаем в горутине
+	go func() {
+		if err := server.ListenAndServe("tcp", config.BindAddress); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	<-ctx.Done()
+	// HTTP сервер не имеет метода Close, нужно доработать
 }
 
 // SpawnRoutine for TCPClientTunnelConfig
-func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
 		log.Fatal(err)
@@ -288,28 +300,40 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer server.Close()
+
+	// Закрываем слушатель при отмене контекста
+	go func() {
+		<-ctx.Done()
+		server.Close()
+	}()
 
 	for {
 		conn, err := server.Accept()
 		if err != nil {
-			log.Fatal(err)
+			select {
+			case <-ctx.Done():
+				return // нормальное завершение
+			default:
+				log.Fatal(err)
+			}
 		}
-		go tcpClientForward(vt, raddr, conn)
+		go tcpClientForward(ctx, vt, raddr, conn)
 	}
 }
 
 // SpawnRoutine for STDIOTunnelConfig
-func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+func (conf *STDIOTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	go STDIOTcpForward(vt, raddr)
+	go STDIOTcpForward(ctx, vt, raddr)
 }
 
 // SpawnRoutine for TCPServerTunnelConfig
-func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
 		log.Fatal(err)
@@ -320,19 +344,30 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer server.Close()
+
+	go func() {
+		<-ctx.Done()
+		server.Close()
+	}()
 
 	for {
 		conn, err := server.Accept()
 		if err != nil {
-			log.Fatal(err)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Fatal(err)
+			}
 		}
-		go tcpServerForward(vt, raddr, conn)
+		go tcpServerForward(ctx, vt, raddr, conn)
 	}
 }
 
 // SpawnRoutine for UDPProxyTunnelConfig
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	conf.SpawnUDPProxy(vt)
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) {
+	conf.SpawnUDPProxy(ctx, vt)
 }
 
 // connForward copy data from `from` to `to`
@@ -347,29 +382,43 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 }
 
 // tcpClientForward starts a new connection via wireguard and forward traffic from `conn`
-func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
+func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
+	defer conn.Close()
+
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
-		_ = conn.Close()
 		errorLogger.Printf("TCP Client Tunnel resolve error for %s: %v\n", raddr.address, err)
 		return
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
 	if err != nil {
-		_ = conn.Close()
 		errorLogger.Printf("TCP Client Tunnel to %s: %v\n", target, err)
 		return
 	}
+	defer sconn.Close()
 
-	go connForward(sconn, conn)
-	go connForward(conn, sconn)
+	// Копирование данных с возможностью прерывания по контексту
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = CopyWithPool(conn, sconn)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = CopyWithPool(sconn, conn)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// При отмене контекста закрываем соединения (defer сработает)
+	}
 }
 
 // STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
-func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
+func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
 		errorLogger.Printf("Name resolution error for %s: %s\n", raddr.address, err.Error())
@@ -381,6 +430,7 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 		errorLogger.Printf("Failed to open /dev/stdout: %s\n", err.Error())
 		return
 	}
+	defer stdout.Close()
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
@@ -388,30 +438,50 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 		errorLogger.Printf("TCP Client Tunnel to %s (%s): %s\n", target, tcpAddr, err.Error())
 		return
 	}
+	defer sconn.Close()
 
+	// Используем connForward для stdin/stdout
 	go connForward(os.Stdin, sconn)
 	go connForward(sconn, stdout)
+
+	// Ждём отмены контекста
+	<-ctx.Done()
+	// Закрытие через defer
 }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
-func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
+func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
+	defer conn.Close()
+
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
-		_ = conn.Close()
 		errorLogger.Printf("TCP Server Tunnel resolve error for %s: %v\n", raddr.address, err)
 		return
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-
 	sconn, err := net.DialTCP("tcp", nil, tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
+	defer sconn.Close()
 
-	go connForward(sconn, conn)
-	go connForward(conn, sconn)
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = CopyWithPool(conn, sconn)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = CopyWithPool(sconn, conn)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// defer закроет соединения
+	}
 }
 
 // ---------- Health check and ping ----------
