@@ -2,6 +2,7 @@ package wireproxy
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -204,22 +205,66 @@ func ParseASecConfig(section *ini.Section) (*ASecConfigType, error) {
 	return config, nil
 }
 
-// ValidateASecConfig — без изменений (оставлен как был).
+// ValidateASecConfig — расширенная валидация всех параметров AmneziaWG.
 func ValidateASecConfig(config *ASecConfigType) error {
 	if config == nil {
 		return nil
 	}
+
+	// Проверка на отрицательные значения для всех целочисленных полей
+	if config.hasJunkPacketCount && config.junkPacketCount < 0 {
+		return errors.New("Jc must be non-negative")
+	}
+	if config.hasJunkPacketMinSize && config.junkPacketMinSize < 0 {
+		return errors.New("Jmin must be non-negative")
+	}
+	if config.hasJunkPacketMaxSize && config.junkPacketMaxSize < 0 {
+		return errors.New("Jmax must be non-negative")
+	}
+	if config.hasInitPacketJunkSize && config.initPacketJunkSize < 0 {
+		return errors.New("S1 must be non-negative")
+	}
+	if config.hasResponsePacketJunkSize && config.responsePacketJunkSize < 0 {
+		return errors.New("S2 must be non-negative")
+	}
+	if config.hasCookieReplyPacketJunkSize && config.cookieReplyPacketJunkSize < 0 {
+		return errors.New("S3 must be non-negative")
+	}
+	if config.hasTransportPacketJunkSize && config.transportPacketJunkSize < 0 {
+		return errors.New("S4 must be non-negative")
+	}
+
+	// Проверка Jc
 	if config.hasJunkPacketCount && (config.junkPacketCount < 1 || config.junkPacketCount > 128) {
 		return errors.New("value of the Jc field must be within the range of 1 to 128")
 	}
+
+	// Проверка Jmin/Jmax
+	const maxAllowedSize = 1280
+	if config.hasJunkPacketMaxSize && config.junkPacketMaxSize > maxAllowedSize {
+		return fmt.Errorf("Jmax must be less than or equal to %d", maxAllowedSize)
+	}
 	if config.hasJunkPacketMinSize && config.hasJunkPacketMaxSize &&
 		config.junkPacketMinSize > config.junkPacketMaxSize {
-		return errors.New("value of the Jmin field must be less than or equal to Jmax field value")
-	}
-	if config.hasJunkPacketMaxSize && config.junkPacketMaxSize > 1280 {
-		return errors.New("value of the Jmax field must be less than or equal 1280")
+		return errors.New("Jmin must be less than or equal to Jmax")
 	}
 
+	// Проверка размеров мусора (S1-S4) на максимальное значение (65535)
+	const maxJunkSize = 65535
+	if config.hasInitPacketJunkSize && config.initPacketJunkSize > maxJunkSize {
+		return fmt.Errorf("S1 exceeds maximum allowed value (%d)", maxJunkSize)
+	}
+	if config.hasResponsePacketJunkSize && config.responsePacketJunkSize > maxJunkSize {
+		return fmt.Errorf("S2 exceeds maximum allowed value (%d)", maxJunkSize)
+	}
+	if config.hasCookieReplyPacketJunkSize && config.cookieReplyPacketJunkSize > maxJunkSize {
+		return fmt.Errorf("S3 exceeds maximum allowed value (%d)", maxJunkSize)
+	}
+	if config.hasTransportPacketJunkSize && config.transportPacketJunkSize > maxJunkSize {
+		return fmt.Errorf("S4 exceeds maximum allowed value (%d)", maxJunkSize)
+	}
+
+	// Проверка уникальности размеров пакетов
 	const (
 		messageInitiationSize = 148
 		messageResponseSize   = 92
@@ -259,15 +304,46 @@ func ValidateASecConfig(config *ASecConfigType) error {
 		}
 	}
 
+	// Проверка интервалов магических заголовков
 	intervals := collectEffectiveHeaderIntervals(config)
 	for _, interval := range intervals {
 		if interval.min > interval.max {
 			return errors.New("invalid magic header range: lower bound cannot exceed upper bound")
 		}
+		if interval.min == 0 {
+			return fmt.Errorf("%s cannot be zero", interval.key)
+		}
 	}
 	if hasOverlappingHeaderIntervals(intervals) {
 		return errors.New("values of the H1-H4 fields must be unique")
 	}
+
+	// Проверка строковых полей I1-I5 (не пустые)
+	validateStringField := func(val *string, fieldName string) error {
+		if val == nil {
+			return nil
+		}
+		if len(*val) == 0 {
+			return fmt.Errorf("%s cannot be empty", fieldName)
+		}
+		return nil
+	}
+	if err := validateStringField(config.i1, "I1"); err != nil {
+		return err
+	}
+	if err := validateStringField(config.i2, "I2"); err != nil {
+		return err
+	}
+	if err := validateStringField(config.i3, "I3"); err != nil {
+		return err
+	}
+	if err := validateStringField(config.i4, "I4"); err != nil {
+		return err
+	}
+	if err := validateStringField(config.i5, "I5"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
