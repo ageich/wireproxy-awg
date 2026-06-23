@@ -35,6 +35,8 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
+const idleTimeout = 5 * time.Minute // таймаут бездействия для TCP-соединений
+
 // errorLogger is the logger to print error message
 var errorLogger = log.New(os.Stderr, "ERROR: ", log.LstdFlags)
 
@@ -413,6 +415,10 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
+	// Устанавливаем таймаут на чтение для обоих соединений
+	_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
+
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = CopyWithPool(conn, sconn)
@@ -453,6 +459,11 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	}
 	defer sconn.Close()
 
+	// Устанавливаем таймаут на чтение для STDIN и stdout (не критично, но можно)
+	_ = os.Stdin.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = stdout.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
+
 	go connForward(os.Stdin, sconn)
 	go connForward(sconn, stdout)
 
@@ -476,6 +487,10 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 		return
 	}
 	defer sconn.Close()
+
+	// Устанавливаем таймаут на чтение для обоих соединений
+	_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
 
 	done := make(chan struct{}, 2)
 	go func() {
