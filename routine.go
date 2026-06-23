@@ -104,10 +104,16 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cac
 func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.cache == nil || newSize <= 0 {
+
+	if newSize < 1 {
+		newSize = 1
+	}
+
+	if r.cache == nil {
 		r.cache = expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
 		return
 	}
+
 	newCache := expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
 	for _, key := range r.cache.Keys() {
 		if val, ok := r.cache.Get(key); ok {
@@ -120,14 +126,16 @@ func (r *fixedResolver) SetCacheSize(newSize int) {
 // Resolve implements socks5.NameResolver
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	r.mu.RLock()
-	cache := r.cache
+	ip, ok := r.cache.Get(name)
 	r.mu.RUnlock()
 
-	if ip, ok := cache.Get(name); ok {
+	if ok {
 		return ctx, ip, nil
 	}
 
-	var ip net.IP
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	if r.systemDNS {
 		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
 		if err != nil || len(ips) == 0 {
@@ -342,7 +350,8 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
-		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
+		errorLogger.Printf("TCP Client Tunnel resolve error for %s: %v\n", raddr.address, err)
 		return
 	}
 
@@ -350,7 +359,8 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
 	if err != nil {
-		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
+		errorLogger.Printf("TCP Client Tunnel to %s: %v\n", target, err)
 		return
 	}
 
@@ -387,7 +397,8 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort) {
 func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
-		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
+		errorLogger.Printf("TCP Server Tunnel resolve error for %s: %v\n", raddr.address, err)
 		return
 	}
 
@@ -540,6 +551,10 @@ func (d VirtualTun) pingIPs() {
 					return
 				}
 
+				if len(replyPing.Data) < 4 {
+					errorLogger.Printf("Failed to parse ping response from %s: packet too short\n", addr)
+					return
+				}
 				seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
 				pongBody := replyPing.Data[4:]
 				if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
@@ -570,6 +585,7 @@ func (d *VirtualTun) StartPingIPs() {
 	d.pingStop = stopChan
 
 	go func(stop <-chan struct{}) {
+		d.pingIPs()
 		ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
 		defer ticker.Stop()
 		for {
