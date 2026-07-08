@@ -6,7 +6,7 @@
 ./wireproxy --max-memory 600 -c config.conf
 
 Так же возможно задать максимальное значение потребления памяти через переменную окружения (поддерживаются суффиксы):
-export GOMEMLIMIT=600MiB   # или 1GiB, 2GB, 1024KiB и т.д.
+export GOMEMLIMIT=600MiB   # или 1GiB, 2GB, 1024KiB и т.д.,
 ./wireproxy -c config.conf
 
 # wireproxy-awg
