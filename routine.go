@@ -152,7 +152,7 @@ func (d VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort
 
 // ---------- SpawnRoutine implementations ----------
 
-// SpawnRoutine for Socks5Config
+// SpawnRoutine for Socks5Config (с retry при создании listener)
 func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, vt.DnsTtl, vt.DnsCacheSize)
 	config.resolver = resolver
@@ -175,9 +175,19 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 
 	server := socks5.NewServer(options...)
 
-	listener, err := net.Listen("tcp", config.BindAddress)
+	// Попытка создать слушатель с retry (до 5 раз)
+	var listener net.Listener
+	var err error
+	for i := 0; i < 5; i++ {
+		listener, err = net.Listen("tcp", config.BindAddress)
+		if err == nil {
+			break
+		}
+		Log.Warn("Failed to listen, retrying...", "attempt", i+1, "error", err)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", config.BindAddress, err)
+		return fmt.Errorf("failed to listen on %s after retries: %w", config.BindAddress, err)
 	}
 	defer listener.Close()
 
