@@ -23,7 +23,6 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/hashicorp/golang-lru/v2"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/bufferpool"
 	"golang.org/x/net/icmp"
@@ -61,15 +60,14 @@ type VirtualTun struct {
 	PingRecord *lru.Cache[string, uint64]
 	// pingStop allows to stop the background ping goroutine
 	pingStop   chan struct{}
-	pingStopMu sync.Mutex // защищает доступ к pingStop
-	// DnsCacheSize определяет максимальное количество записей в DNS-кэше (LRU)
-	DnsCacheSize int
-	// UdpSessionCacheSize определяет максимальное количество UDP-сессий (LRU)
+	pingStopMu sync.Mutex
+	// DnsCacheSize, UdpSessionCacheSize, DnsTtl — размеры кэшей и TTL
+	DnsCacheSize        int
 	UdpSessionCacheSize int
+	DnsTtl              time.Duration // TTL для DNS-кэша
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
-// Теперь возвращает ошибку.
 type RoutineSpawner interface {
 	SpawnRoutine(ctx context.Context, vt *VirtualTun) error
 }
@@ -78,95 +76,6 @@ type addressPort struct {
 	address string
 	port    uint16
 }
-
-// ---------- DNS resolver with LRU cache (limited memory growth) ----------
-
-// fixedResolver implements socks5.NameResolver with a bounded LRU cache + TTL
-type fixedResolver struct {
-	tnet      *netstack.Net
-	systemDNS bool
-	cache     *expirable.LRU[string, net.IP]
-	ttl       time.Duration
-	mu        sync.RWMutex
-}
-
-// NewFixedResolver creates a new resolver with LRU cache and TTL expiration
-func NewFixedResolver(tnet *netstack.Net, systemDNS bool, ttl time.Duration, cacheSize int) *fixedResolver {
-	cache := expirable.NewLRU[string, net.IP](cacheSize, nil, ttl)
-	return &fixedResolver{
-		tnet:      tnet,
-		systemDNS: systemDNS,
-		cache:     cache,
-		ttl:       ttl,
-	}
-}
-
-// SetCacheSize изменяет размер кэша, создавая новый кэш с новым размером
-// и копируя существующие записи из старого кэша (если они есть).
-func (r *fixedResolver) SetCacheSize(newSize int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if newSize < 1 {
-		newSize = 1
-	}
-
-	if r.cache == nil {
-		r.cache = expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
-		return
-	}
-
-	newCache := expirable.NewLRU[string, net.IP](newSize, nil, r.ttl)
-	for _, key := range r.cache.Keys() {
-		if val, ok := r.cache.Get(key); ok {
-			newCache.Add(key, val)
-		}
-	}
-	r.cache = newCache
-}
-
-// Resolve implements socks5.NameResolver
-func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	r.mu.RLock()
-	ip, ok := r.cache.Get(name)
-	r.mu.RUnlock()
-
-	if ok {
-		return ctx, ip, nil
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	if r.systemDNS {
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
-		if err != nil || len(ips) == 0 {
-			return ctx, nil, err
-		}
-		ip = ips[0]
-	} else {
-		addrs, err := r.tnet.LookupContextHost(ctx, name)
-		if err != nil || len(addrs) == 0 {
-			return ctx, nil, err
-		}
-		ip = net.ParseIP(addrs[0])
-		if ip == nil {
-			return ctx, nil, errors.New("failed to parse IP")
-		}
-	}
-
-	r.mu.Lock()
-	r.cache.Add(name, ip)
-	r.mu.Unlock()
-	return ctx, ip, nil
-}
-
-// Stop is a no-op for compatibility
-func (r *fixedResolver) Stop() {
-	// Nothing to do
-}
-
-// ---------- End of DNS resolver ----------
 
 // LookupAddr lookups a hostname.
 func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
@@ -241,11 +150,11 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
-// ---------- SpawnRoutine implementations (теперь возвращают ошибку) ----------
+// ---------- SpawnRoutine implementations ----------
 
-// SpawnRoutine for Socks5Config
+// SpawnRoutine for Socks5Config (использует новый резолвер из dns.go)
 func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, 5*time.Minute, vt.DnsCacheSize)
+	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, vt.DnsTtl, vt.DnsCacheSize)
 	config.resolver = resolver
 
 	var authMethods []socks5.Authenticator
@@ -280,7 +189,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 	if err := server.Serve(listener); err != nil {
 		select {
 		case <-ctx.Done():
-			// нормальное завершение
 			return nil
 		default:
 			return fmt.Errorf("SOCKS5 server error: %w", err)
@@ -413,7 +321,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	// Используем глобальные таймауты
 	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
@@ -432,7 +339,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	select {
 	case <-done:
 	case <-ctx.Done():
-		// defer закроет соединения
 	}
 }
 
@@ -459,7 +365,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	}
 	defer sconn.Close()
 
-	// Для stdin таймаут не устанавливаем, для stdout и sconn – устанавливаем
 	_ = stdout.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = stdout.SetWriteDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
@@ -507,7 +412,6 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	select {
 	case <-done:
 	case <-ctx.Done():
-		// defer закроет соединения
 	}
 }
 
