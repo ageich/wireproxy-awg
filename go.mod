@@ -18,8 +18,11 @@ require (
 require (
 	github.com/google/btree v1.1.3 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/mod v0.28.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
+	golang.org/x/tools v0.37.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gvisor.dev/gvisor v0.0.0-20250718015824-35000683b6d7 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
