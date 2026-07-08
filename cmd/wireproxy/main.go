@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -158,11 +159,52 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error
 	return landlock.V4.BestEffort().RestrictNet(rules...)
 }
 
+// parseSize преобразует строку с суффиксом (KiB, MiB, GiB, KB, MB, GB) в байты.
+// Если суффикс отсутствует, интерпретирует как число в байтах.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+
+	// Определяем множитель
+	var multiplier int64 = 1
+	lower := strings.ToLower(s)
+
+	switch {
+	case strings.HasSuffix(lower, "kib"):
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "KiB")
+	case strings.HasSuffix(lower, "mib"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MiB")
+	case strings.HasSuffix(lower, "gib"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GiB")
+	case strings.HasSuffix(lower, "kb"):
+		multiplier = 1000
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(lower, "mb"):
+		multiplier = 1000 * 1000
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(lower, "gb"):
+		multiplier = 1000 * 1000 * 1000
+		s = strings.TrimSuffix(s, "GB")
+	}
+
+	// Если суффикс не распознан, пытаемся распарсить как целое число (байты)
+	val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number format: %w", err)
+	}
+	return val * multiplier, nil
+}
+
 func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
 	envLimit := os.Getenv("GOMEMLIMIT")
 	var limitBytes int64 = 0
 	if envLimit != "" {
-		if val, err := strconv.ParseInt(envLimit, 10, 64); err == nil && val > 0 {
+		if val, err := parseSize(envLimit); err == nil && val > 0 {
 			limitBytes = val
 		} else {
 			log.Printf("Warning: GOMEMLIMIT environment variable has invalid value: %s", envLimit)
