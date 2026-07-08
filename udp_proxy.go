@@ -3,7 +3,6 @@ package wireproxy
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -24,7 +23,7 @@ type UDPProxyTunnelConfig struct {
 	BindAddress       string
 	Target            string
 	InactivityTimeout int
-	mu                sync.RWMutex // защищает sessions
+	mu                sync.RWMutex
 	sessions          *lru.Cache[string, *udpSession]
 }
 
@@ -99,7 +98,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 	conf.sessions = sessions
 	conf.mu.Unlock()
 
-	var sessionMu sync.RWMutex // позволяет параллельное чтение
+	var sessionMu sync.RWMutex
 
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
@@ -136,7 +135,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 					if currentCache != nil {
 						keys := currentCache.Keys()
 						sessionMu.RUnlock()
-						// Блокируем только на время удаления
 						sessionMu.Lock()
 						for _, key := range keys {
 							if sess, ok := currentCache.Get(key); ok {
@@ -167,10 +165,8 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 		}
 		sessionMu.RUnlock()
 
-		// Создаём новую сессию
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
-		// Double-check после получения блокировки
 		conf.mu.RLock()
 		currentCache = conf.sessions
 		conf.mu.RUnlock()
@@ -196,7 +192,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 		return s, nil
 	}
 
-	// Основной цикл чтения из UDP с поддержкой контекста
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
