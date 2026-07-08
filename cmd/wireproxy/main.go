@@ -161,6 +161,7 @@ func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error
 }
 
 // parseSize преобразует строку с суффиксом (KiB, MiB, GiB, KB, MB, GB) в байты.
+// Регистронезависима: поддерживает "512MiB", "512mib", "512MIB" и т.д.
 // Если суффикс отсутствует, интерпретирует как число в байтах.
 func parseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
@@ -174,24 +175,25 @@ func parseSize(s string) (int64, error) {
 	switch {
 	case strings.HasSuffix(lower, "kib"):
 		multiplier = 1024
-		s = strings.TrimSuffix(s, "KiB")
+		s = s[:len(s)-3] // удаляем "KiB" (3 символа)
 	case strings.HasSuffix(lower, "mib"):
 		multiplier = 1024 * 1024
-		s = strings.TrimSuffix(s, "MiB")
+		s = s[:len(s)-3] // "MiB" - 3 символа
 	case strings.HasSuffix(lower, "gib"):
 		multiplier = 1024 * 1024 * 1024
-		s = strings.TrimSuffix(s, "GiB")
+		s = s[:len(s)-3] // "GiB" - 3 символа
 	case strings.HasSuffix(lower, "kb"):
 		multiplier = 1000
-		s = strings.TrimSuffix(s, "KB")
+		s = s[:len(s)-2] // "KB" - 2 символа
 	case strings.HasSuffix(lower, "mb"):
 		multiplier = 1000 * 1000
-		s = strings.TrimSuffix(s, "MB")
+		s = s[:len(s)-2] // "MB" - 2 символа
 	case strings.HasSuffix(lower, "gb"):
 		multiplier = 1000 * 1000 * 1000
-		s = strings.TrimSuffix(s, "GB")
+		s = s[:len(s)-2] // "GB" - 2 символа
 	}
 
+	// Парсим числовую часть (уже без суффикса)
 	val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid number format: %w", err)
