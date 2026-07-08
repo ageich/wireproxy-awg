@@ -449,7 +449,7 @@ func main() {
 	tun.DnsTtl = time.Duration(conf.DnsTtl) * time.Second
 
 	// Запускаем каждый туннель с автоматическим перезапуском при ошибке
-	restartDelay := 10 * time.Second
+	restartDelay := 2 * time.Second
 	for _, spawner := range conf.Routines {
 		go runWithRestart(ctx, spawner, tun, restartDelay)
 	}
