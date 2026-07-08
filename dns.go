@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/miekg/dns"
+	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
 // fixedResolver реализует socks5.NameResolver с LRU-кэшем и учётом TTL из DNS-ответа.
@@ -87,14 +88,9 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	}
 
 	r.mu.Lock()
-	// Используем AddWithTTL, если метод существует
-	if lru, ok := r.cache.(interface {
-		AddWithTTL(string, net.IP, time.Duration) bool
-	}); ok {
-		lru.AddWithTTL(name, ipNet, ttl)
-	} else {
-		r.cache.Add(name, ipNet)
-	}
+	// Используем Add - кэш сам управляет TTL на основе defaultTTL
+	// Запись будет жить defaultTTL, что приемлемо.
+	r.cache.Add(name, ipNet)
 	r.mu.Unlock()
 	return ctx, ipNet, nil
 }
