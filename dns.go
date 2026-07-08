@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
