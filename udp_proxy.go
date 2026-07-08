@@ -18,12 +18,12 @@ type udpSession struct {
 	inactivityDur time.Duration
 }
 
-// UDPProxyTunnelConfig — полная структура с полями для управления кэшем
+// UDPProxyTunnelConfig — структура с полями для управления кэшем
 type UDPProxyTunnelConfig struct {
 	BindAddress       string
 	Target            string
 	InactivityTimeout int
-	mu                sync.Mutex
+	mu                sync.RWMutex // защищает sessions
 	sessions          *lru.Cache[string, *udpSession]
 }
 
@@ -63,7 +63,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 	}
 	defer listener.Close()
 
-	// Закрываем слушатель при отмене контекста
 	go func() {
 		<-ctx.Done()
 		listener.Close()
@@ -94,14 +93,14 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 	conf.sessions = sessions
 	conf.mu.Unlock()
 
-	var sessionMu sync.Mutex
+	var sessionMu sync.RWMutex // теперь позволяет параллельное чтение
 
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
-		conf.mu.Lock()
+		conf.mu.RLock()
 		currentCache := conf.sessions
-		conf.mu.Unlock()
+		conf.mu.RUnlock()
 		if currentCache != nil {
 			if existing, ok := currentCache.Get(src); ok && existing == sess {
 				currentCache.Remove(src)
@@ -111,7 +110,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 
 	if conf.InactivityTimeout > 0 {
 		go func() {
-			// Увеличиваем интервал проверки с 10 до 30 секунд для снижения нагрузки
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -120,12 +118,16 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 					return
 				case <-ticker.C:
 					now := time.Now()
-					sessionMu.Lock()
-					conf.mu.Lock()
+					sessionMu.RLock()
+					conf.mu.RLock()
 					currentCache := conf.sessions
-					conf.mu.Unlock()
+					conf.mu.RUnlock()
 					if currentCache != nil {
-						for _, key := range currentCache.Keys() {
+						keys := currentCache.Keys()
+						sessionMu.RUnlock()
+						// Блокируем только на время удаления
+						sessionMu.Lock()
+						for _, key := range keys {
 							if sess, ok := currentCache.Get(key); ok {
 								if now.Sub(sess.lastActive) >= inactivityDur {
 									errorLogger.Printf("UDPProxyTunnel: closing inactive session for %s", key)
@@ -133,21 +135,34 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 								}
 							}
 						}
+						sessionMu.Unlock()
+					} else {
+						sessionMu.RUnlock()
 					}
-					sessionMu.Unlock()
 				}
 			}
 		}()
 	}
 
 	getOrCreateSession := func(srcAddr string) (*udpSession, error) {
+		sessionMu.RLock()
+		conf.mu.RLock()
+		currentCache := conf.sessions
+		conf.mu.RUnlock()
+		if s, ok := currentCache.Get(srcAddr); ok {
+			s.lastActive = time.Now()
+			sessionMu.RUnlock()
+			return s, nil
+		}
+		sessionMu.RUnlock()
+
+		// Создаём новую сессию
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
-
-		conf.mu.Lock()
-		currentCache := conf.sessions
-		conf.mu.Unlock()
-
+		// Double-check после получения блокировки
+		conf.mu.RLock()
+		currentCache = conf.sessions
+		conf.mu.RUnlock()
 		if s, ok := currentCache.Get(srcAddr); ok {
 			s.lastActive = time.Now()
 			return s, nil
@@ -208,7 +223,6 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 		}
 	}()
 
-	// Ожидаем отмены контекста (чтобы горутина не завершилась сразу)
 	<-ctx.Done()
 	return nil
 }
