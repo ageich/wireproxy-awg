@@ -9,10 +9,11 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/miekg/dns"
 )
 
 // fixedResolver реализует socks5.NameResolver с LRU-кэшем и фиксированным TTL.
-// Использует системный резолвер (net.DefaultResolver) для получения IP.
+// Для системных запросов использует прямой UDP-запрос к 1.1.1.1:53.
 type fixedResolver struct {
 	tnet       *netstack.Net
 	systemDNS  bool
@@ -62,7 +63,7 @@ func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.cache = newCache
 }
 
-// Resolve выполняет DNS-запрос с использованием системного резолвера или туннельного.
+// Resolve выполняет DNS-запрос.
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	r.mu.RLock()
 	ip, ok := r.cache.Get(name)
@@ -89,13 +90,27 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	return ctx, ipNet, nil
 }
 
-// resolveSystemDNS использует системный резолвер (без получения TTL).
+// resolveSystemDNS выполняет прямой UDP-запрос к 1.1.1.1:53.
+// TTL из ответа игнорируется – используется defaultTTL из кэша.
 func (r *fixedResolver) resolveSystemDNS(ctx context.Context, name string) (net.IP, error) {
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
-	if err != nil || len(ips) == 0 {
+	c := new(dns.Client)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	m.RecursionDesired = true
+
+	resp, _, err := c.ExchangeContext(ctx, m, "1.1.1.1:53")
+	if err != nil {
 		return nil, err
 	}
-	return ips[0], nil
+	if len(resp.Answer) == 0 {
+		return nil, errors.New("no A record found")
+	}
+	for _, ans := range resp.Answer {
+		if a, ok := ans.(*dns.A); ok {
+			return a.A, nil
+		}
+	}
+	return nil, errors.New("no A record")
 }
 
 // resolveOverTun использует туннельный резолвер.
