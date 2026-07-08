@@ -136,8 +136,9 @@ func parseAddressPort(endpoint string) (*addressPort, error) {
 	return &addressPort{address: name, port: uint16(port)}, nil
 }
 
-func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, error) {
-	addr, err := d.ResolveAddrWithContext(context.Background(), endpoint.address)
+// resolveToAddrPort теперь принимает контекст для корректной отмены DNS-запросов
+func (d VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort) (*netip.AddrPort, error) {
+	addr, err := d.ResolveAddrWithContext(ctx, endpoint.address)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +329,7 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	target, err := vt.resolveToAddrPort(raddr)
+	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("TCP Client Tunnel resolve error", "address", raddr.address, "error", err)
 		return
@@ -380,7 +381,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 			Log.Error("STDIOTcpForward panicked", "recover", r)
 		}
 	}()
-	target, err := vt.resolveToAddrPort(raddr)
+	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("Name resolution error", "address", raddr.address, "error", err)
 		return
@@ -435,7 +436,7 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	target, err := vt.resolveToAddrPort(raddr)
+	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("TCP Server Tunnel resolve error", "address", raddr.address, "error", err)
 		return
