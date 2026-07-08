@@ -22,9 +22,44 @@ type DeviceSetting struct {
 	MTU        int
 }
 
+// validateDeviceConfig проверяет обязательные поля конфигурации перед построением IPC.
+func validateDeviceConfig(conf *DeviceConfig) error {
+	if conf.SecretKey == "" {
+		return fmt.Errorf("PrivateKey is required")
+	}
+	if len(conf.SecretKey) != 64 {
+		return fmt.Errorf("PrivateKey must be 64 hex characters (32 bytes)")
+	}
+	if len(conf.Peers) == 0 {
+		return fmt.Errorf("at least one Peer is required")
+	}
+	for i, peer := range conf.Peers {
+		if peer.PublicKey == "" {
+			return fmt.Errorf("Peer[%d]: PublicKey is required", i)
+		}
+		if len(peer.PublicKey) != 64 {
+			return fmt.Errorf("Peer[%d]: PublicKey must be 64 hex characters (32 bytes)", i)
+		}
+		if peer.Endpoint == nil || *peer.Endpoint == "" {
+			return fmt.Errorf("Peer[%d]: Endpoint is required", i)
+		}
+		if len(peer.AllowedIPs) == 0 {
+			return fmt.Errorf("Peer[%d]: at least one AllowedIP is required", i)
+		}
+	}
+	return nil
+}
+
 // CreateIPCRequest serialize the config into an IPC request and DeviceSetting
+// Оптимизировано: предварительное выделение буфера для уменьшения перераспределений.
 func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
+	// Валидация перед построением IPC
+	if err := validateDeviceConfig(conf); err != nil {
+		return nil, fmt.Errorf("invalid device config: %w", err)
+	}
+
 	var request bytes.Buffer
+	request.Grow(4096)
 
 	fmt.Fprintf(&request, "private_key=%s\n", conf.SecretKey)
 
@@ -36,7 +71,6 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 		aSecConfig := conf.ASecConfig
 
 		var aSecBuilder strings.Builder
-
 		if aSecConfig.hasJunkPacketCount {
 			fmt.Fprintf(&aSecBuilder, "jc=%d\n", aSecConfig.junkPacketCount)
 		}
@@ -82,7 +116,6 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 				formatMagicHeaderInterval(aSecConfig.transportPacketMagicHeader, aSecConfig.transportPacketMagicHeaderMax),
 			)
 		}
-
 		if aSecConfig.i1 != nil {
 			fmt.Fprintf(&aSecBuilder, "i1=%s\n", *aSecConfig.i1)
 		}
@@ -126,7 +159,12 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 		}
 	}
 
-	setting := &DeviceSetting{IpcRequest: request.String(), DNS: conf.DNS, DeviceAddr: conf.Endpoint, MTU: conf.MTU}
+	setting := &DeviceSetting{
+		IpcRequest: request.String(),
+		DNS:        conf.DNS,
+		DeviceAddr: conf.Endpoint,
+		MTU:        conf.MTU,
+	}
 	return setting, nil
 }
 
