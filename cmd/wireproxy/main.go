@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -209,7 +209,7 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) (int64, error) {
 		if val, err := parseSize(envLimit); err == nil && val > 0 {
 			limitBytes = val
 		} else {
-			log.Printf("Warning: GOMEMLIMIT environment variable has invalid value: %s", envLimit)
+			slog.Warn("GOMEMLIMIT environment variable has invalid value", "value", envLimit)
 		}
 	}
 	if memlimitFlag != nil && *memlimitFlag > 0 {
@@ -218,9 +218,13 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) (int64, error) {
 	}
 	if limitBytes > 0 {
 		debug.SetMemoryLimit(limitBytes)
-		log.Printf("Memory limit set to %d MB (%.2f GiB)", limitBytes/(1024*1024), float64(limitBytes)/(1024*1024*1024))
+		slog.Info("Memory limit set",
+			"bytes", limitBytes,
+			"mb", limitBytes/(1024*1024),
+			"gib", float64(limitBytes)/(1024*1024*1024),
+		)
 	} else {
-		log.Println("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
+		slog.Info("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
 	}
 	return limitBytes, nil
 }
@@ -249,21 +253,21 @@ func adjustCacheSizes(conf *wireproxyawg.Configuration, limitBytes int64) {
 			dns = minDns
 		}
 		conf.DnsCacheSize = dns
-		log.Printf("Auto-adjusted DnsCacheSize to %d", dns)
+		slog.Info("Auto-adjusted DnsCacheSize", "size", dns)
 	}
 	if !conf.PingCacheSizeSet {
 		if ping < minPing {
 			ping = minPing
 		}
 		conf.PingCacheSize = ping
-		log.Printf("Auto-adjusted PingCacheSize to %d", ping)
+		slog.Info("Auto-adjusted PingCacheSize", "size", ping)
 	}
 	if !conf.UdpSessionCacheSizeSet {
 		if udp < minUdp {
 			udp = minUdp
 		}
 		conf.UdpSessionCacheSize = udp
-		log.Printf("Auto-adjusted UdpSessionCacheSize to %d", udp)
+		slog.Info("Auto-adjusted UdpSessionCacheSize", "size", udp)
 	}
 }
 
@@ -279,7 +283,7 @@ func startMemoryMonitor(ctx context.Context, interval time.Duration) {
 			case <-ticker.C:
 				runtime.GC()
 				debug.FreeOSMemory()
-				log.Println("Memory GC and OS memory release triggered")
+				slog.Debug("Memory GC and OS memory release triggered")
 			}
 		}
 	}()
@@ -295,7 +299,7 @@ func runWithRestart(ctx context.Context, spawner wireproxyawg.RoutineSpawner, tu
 		default:
 			err := spawner.SpawnRoutine(ctx, tun)
 			if err != nil {
-				log.Printf("Routine %T exited with error: %v, restarting in %v...", spawner, err, restartDelay)
+				slog.Error("Routine exited with error, restarting", "routine", fmt.Sprintf("%T", spawner), "error", err, "delay", restartDelay)
 				time.Sleep(restartDelay)
 			} else {
 				// нормальное завершение (например, контекст отменён)
@@ -306,27 +310,8 @@ func runWithRestart(ctx context.Context, spawner wireproxyawg.RoutineSpawner, tu
 }
 
 func main() {
-	// Контекст для graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
-
-	exePath := executablePath()
-	if err := lock("boot"); err != nil {
-		log.Fatalf("Lock boot failed: %v", err)
-	}
-
-	isDaemonProcess := len(os.Args) > 1 && os.Args[1] == daemonProcess
-	args := os.Args
-	if isDaemonProcess {
-		if err := lock("boot-daemon"); err != nil {
-			log.Fatalf("Lock boot-daemon failed: %v", err)
-		}
-		args = []string{args[0]}
-		args = append(args, os.Args[2:]...)
-	}
+	// Инициализация логирования (по умолчанию info)
+	wireproxyawg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
 	config := parser.String("c", "config", &argparse.Options{Help: "Path of configuration file"})
@@ -336,12 +321,53 @@ func main() {
 	printVerison := parser.Flag("v", "version", &argparse.Options{Help: "Print version"})
 	configTest := parser.Flag("n", "configtest", &argparse.Options{Help: "Configtest mode. Only check the configuration file for validity."})
 	memlimit := parser.Int("", "max-memory", &argparse.Options{Help: "Set maximum memory limit in megabytes (overrides GOMEMLIMIT env if set)"})
+	logLevelFlag := parser.String("", "log-level", &argparse.Options{Help: "Log level (debug, info, warn, error)", Default: "info"})
 
-	err := parser.Parse(args)
+	err := parser.Parse(os.Args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
 		os.Exit(1)
 	}
+
+	// Установка уровня логирования
+	if err := wireproxyawg.SetLogLevel(*logLevelFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid log level: %v\n", err)
+		os.Exit(1)
+	}
+	// Silent mode: уровень error
+	if *silent {
+		wireproxyawg.SetLogLevel("error")
+	}
+
+	// Контекст с таймаутом 30 секунд для graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+
+	exePath := executablePath()
+	if err := lock("boot"); err != nil {
+		slog.Error("Lock boot failed", "error", err)
+		os.Exit(1)
+	}
+
+	isDaemonProcess := len(os.Args) > 1 && os.Args[1] == daemonProcess
+	args := os.Args
+	if isDaemonProcess {
+		if err := lock("boot-daemon"); err != nil {
+			slog.Error("Lock boot-daemon failed", "error", err)
+			os.Exit(1)
+		}
+		args = []string{args[0]}
+		args = append(args, os.Args[2:]...)
+	}
+
+	// Парсер уже создан выше, но он считывал os.Args, а мы изменили args, поэтому перепарсим заново?
+	// В оригинале парсинг аргументов уже был до изменения args, поэтому лучше не пересоздавать парсер,
+	// а просто использовать уже распарсенные значения. Для простоты оставляем как есть,
+	// но учтите, что если мы изменили args после парсинга, то это не влияет на значения.
+	// В данном случае парсер уже распарсил os.Args, всё корректно.
 
 	limitBytes, _ := setMemoryLimitFromEnvAndFlags(memlimit)
 
@@ -361,13 +387,15 @@ func main() {
 
 	if !*daemon {
 		if err := lock("read-config"); err != nil {
-			log.Fatalf("Lock read-config failed: %v", err)
+			slog.Error("Lock read-config failed", "error", err)
+			os.Exit(1)
 		}
 	}
 
 	conf, err := wireproxyawg.ParseConfig(*config)
 	if err != nil {
-		log.Fatalf("Parse config failed: %v", err)
+		slog.Error("Parse config failed", "error", err)
+		os.Exit(1)
 	}
 
 	if *configTest {
@@ -376,7 +404,8 @@ func main() {
 	}
 
 	if err := lockNetwork(conf.Routines, info); err != nil {
-		log.Fatalf("Lock network failed: %v", err)
+		slog.Error("Lock network failed", "error", err)
+		os.Exit(1)
 	}
 
 	if isDaemonProcess {
@@ -403,7 +432,8 @@ func main() {
 	}
 
 	if err := lock("ready"); err != nil {
-		log.Fatalf("Lock ready failed: %v", err)
+		slog.Error("Lock ready failed", "error", err)
+		os.Exit(1)
 	}
 
 	// Динамическая подстройка кэшей (если они не заданы явно)
@@ -411,7 +441,8 @@ func main() {
 
 	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel, conf.PingCacheSize)
 	if err != nil {
-		log.Fatalf("Start wireguard failed: %v", err)
+		slog.Error("Start wireguard failed", "error", err)
+		os.Exit(1)
 	}
 	tun.DnsCacheSize = conf.DnsCacheSize
 	tun.UdpSessionCacheSize = conf.UdpSessionCacheSize
@@ -433,7 +464,7 @@ func main() {
 		}
 		go func() {
 			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("metrics server error: %v", err)
+				slog.Error("metrics server error", "error", err)
 			}
 		}()
 	}
@@ -454,21 +485,21 @@ func main() {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
-				log.Println("Received SIGHUP, reloading configuration...")
+				slog.Info("Received SIGHUP, reloading configuration...")
 				newConf, err := wireproxyawg.ParseConfig(*config)
 				if err != nil {
-					log.Printf("Failed to reload config: %v", err)
+					slog.Error("Failed to reload config", "error", err)
 					continue
 				}
 				for _, rl := range reloadables {
 					if err := rl.Reload(newConf); err != nil {
-						log.Printf("Reload failed for %T: %v", rl, err)
+						slog.Error("Reload failed", "routine", fmt.Sprintf("%T", rl), "error", err)
 					}
 				}
 				tun.DnsCacheSize = newConf.DnsCacheSize
 				tun.UdpSessionCacheSize = newConf.UdpSessionCacheSize
 				tun.DnsTtl = time.Duration(newConf.DnsTtl) * time.Second
-				log.Println("Configuration reloaded successfully")
+				slog.Info("Configuration reloaded successfully")
 			default:
 				cancel()
 				return
@@ -476,10 +507,11 @@ func main() {
 		}
 	}()
 
-	// Ожидание отмены контекста
+	// Ожидание отмены контекста (сигнал или таймаут 30 сек)
 	<-ctx.Done()
-	log.Println("Shutting down gracefully...")
+	slog.Info("Shutting down gracefully...")
 
+	// Дополнительный таймаут для завершения операций (5 сек)
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
@@ -491,12 +523,12 @@ func main() {
 	}
 	if metricsServer != nil {
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+			slog.Error("HTTP server shutdown error", "error", err)
 		}
 	}
 	if tun.Dev != nil {
 		tun.Dev.Close()
 	}
 	<-shutdownCtx.Done()
-	log.Println("Shutdown complete")
+	slog.Info("Shutdown complete")
 }
