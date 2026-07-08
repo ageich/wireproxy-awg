@@ -13,7 +13,7 @@ import (
 )
 
 // fixedResolver реализует socks5.NameResolver с LRU-кэшем и фиксированным TTL.
-// Для системных запросов использует прямой UDP-запрос к 1.1.1.1:53.
+// Сначала пытается использовать системный DNS, при ошибке – внешний (1.1.1.1).
 type fixedResolver struct {
 	tnet       *netstack.Net
 	systemDNS  bool
@@ -34,12 +34,9 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, defaultTTL time.Durati
 }
 
 // SetCacheSize изменяет размер кэша.
-// Если новый размер больше текущего, кэш создаётся без копирования.
-// Если новый размер меньше или равен, записи копируются.
 func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	if newSize < 1 {
 		newSize = 1
 	}
@@ -49,11 +46,9 @@ func (r *fixedResolver) SetCacheSize(newSize int) {
 	}
 	currentSize := r.cache.Len()
 	if newSize > currentSize {
-		// При увеличении создаём новый кэш без копирования
 		r.cache = expirable.NewLRU[string, net.IP](newSize, nil, r.defaultTTL)
 		return
 	}
-	// При уменьшении или равенстве копируем записи
 	newCache := expirable.NewLRU[string, net.IP](newSize, nil, r.defaultTTL)
 	for _, key := range r.cache.Keys() {
 		if val, ok := r.cache.Get(key); ok {
@@ -85,15 +80,22 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	}
 
 	r.mu.Lock()
-	r.cache.Add(name, ipNet) // используем общий TTL кэша (defaultTTL)
+	r.cache.Add(name, ipNet)
 	r.mu.Unlock()
 	return ctx, ipNet, nil
 }
 
-// resolveSystemDNS выполняет прямой UDP-запрос к 1.1.1.1:53.
-// TTL из ответа игнорируется – используется defaultTTL из кэша.
+// resolveSystemDNS – гибрид: сначала системный DNS, при ошибке – внешний 1.1.1.1.
 func (r *fixedResolver) resolveSystemDNS(ctx context.Context, name string) (net.IP, error) {
+	// 1. Пробуем системный резолвер
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
+	if err == nil && len(ips) > 0 {
+		return ips[0], nil
+	}
+
+	// 2. При ошибке – внешний DNS (1.1.1.1)
 	c := new(dns.Client)
+	c.Timeout = 5 * time.Second // таймаут 5 секунд
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
 	m.RecursionDesired = true
