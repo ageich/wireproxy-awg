@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -167,7 +168,6 @@ func parseSize(s string) (int64, error) {
 		return 0, fmt.Errorf("empty size string")
 	}
 
-	// Определяем множитель
 	var multiplier int64 = 1
 	lower := strings.ToLower(s)
 
@@ -192,7 +192,6 @@ func parseSize(s string) (int64, error) {
 		s = strings.TrimSuffix(s, "GB")
 	}
 
-	// Если суффикс не распознан, пытаемся распарсить как целое число (байты)
 	val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid number format: %w", err)
@@ -200,7 +199,7 @@ func parseSize(s string) (int64, error) {
 	return val * multiplier, nil
 }
 
-func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
+func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) (int64, error) {
 	envLimit := os.Getenv("GOMEMLIMIT")
 	var limitBytes int64 = 0
 	if envLimit != "" {
@@ -220,6 +219,67 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) {
 	} else {
 		log.Println("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
 	}
+	return limitBytes, nil
+}
+
+// adjustCacheSizes пересчитывает размеры кэшей, если они не были заданы явно.
+// Распределяет 10% от лимита памяти между кэшами.
+func adjustCacheSizes(conf *wireproxyawg.Configuration, limitBytes int64) {
+	if limitBytes <= 0 {
+		return
+	}
+	// 10% от лимита выделяем под кэши
+	total := limitBytes / 10
+	// Распределение: DNS 30%, Ping 10%, UDP 60%
+	// Приблизительный размер записи: DNS ~64 байта, Ping ~8 байт, UDP-сессия ~1 КБ
+	dns := int(float64(total) * 0.30 / 64)
+	ping := int(float64(total) * 0.10 / 8)
+	udp := int(float64(total) * 0.60 / 1024)
+
+	// Минимальные значения
+	const minDns = 100
+	const minPing = 50
+	const minUdp = 100
+
+	if !conf.DnsCacheSizeSet {
+		if dns < minDns {
+			dns = minDns
+		}
+		conf.DnsCacheSize = dns
+		log.Printf("Auto-adjusted DnsCacheSize to %d", dns)
+	}
+	if !conf.PingCacheSizeSet {
+		if ping < minPing {
+			ping = minPing
+		}
+		conf.PingCacheSize = ping
+		log.Printf("Auto-adjusted PingCacheSize to %d", ping)
+	}
+	if !conf.UdpSessionCacheSizeSet {
+		if udp < minUdp {
+			udp = minUdp
+		}
+		conf.UdpSessionCacheSize = udp
+		log.Printf("Auto-adjusted UdpSessionCacheSize to %d", udp)
+	}
+}
+
+// startMemoryMonitor запускает периодическую очистку памяти.
+func startMemoryMonitor(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				runtime.GC()
+				debug.FreeOSMemory()
+				log.Println("Memory GC and OS memory release triggered")
+			}
+		}
+	}()
 }
 
 // runWithRestart запускает spawner.SpawnRoutine в бесконечном цикле,
@@ -280,7 +340,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setMemoryLimitFromEnvAndFlags(memlimit)
+	limitBytes, _ := setMemoryLimitFromEnvAndFlags(memlimit)
 
 	if *printVerison {
 		fmt.Printf("wireproxy, version %s\n", version)
@@ -343,6 +403,9 @@ func main() {
 		log.Fatalf("Lock ready failed: %v", err)
 	}
 
+	// Динамическая подстройка кэшей (если они не заданы явно)
+	adjustCacheSizes(conf, limitBytes)
+
 	tun, err := wireproxyawg.StartWireguard(conf.Device, logLevel, conf.PingCacheSize)
 	if err != nil {
 		log.Fatalf("Start wireguard failed: %v", err)
@@ -370,6 +433,9 @@ func main() {
 			}
 		}()
 	}
+
+	// Запускаем периодический мониторинг памяти (каждые 5 минут)
+	startMemoryMonitor(ctx, 5*time.Minute)
 
 	// Собираем объекты, поддерживающие перезагрузку
 	var reloadables []wireproxyawg.Reloadable
