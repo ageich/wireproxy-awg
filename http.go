@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-const httpTimeout = 30 * time.Second // общий таймаут для HTTP-запросов
-
 const proxyAuthHeaderKey = "Proxy-Authorization"
 
 type HTTPServer struct {
@@ -35,7 +33,7 @@ func NewHTTPServer(config *HTTPConfig, dial func(network, address string) (net.C
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   httpTimeout,
+		Timeout:   HTTPTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -149,9 +147,11 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		}
 		defer peer.Close()
 
-		// idleTimeout объявлен в routine.go
-		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
-		_ = peer.SetReadDeadline(time.Now().Add(idleTimeout))
+		// Используем глобальные константы таймаутов
+		_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+		_ = peer.SetReadDeadline(time.Now().Add(IdleTimeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
+		_ = peer.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
 		var wg sync.WaitGroup
 		wg.Add(2)
