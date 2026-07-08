@@ -152,7 +152,7 @@ func (d VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort
 
 // ---------- SpawnRoutine implementations ----------
 
-// SpawnRoutine for Socks5Config (с retry при создании listener)
+// SpawnRoutine for Socks5Config – с автоматическим перезапуском при ошибках
 func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
 	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, vt.DnsTtl, vt.DnsCacheSize)
 	config.resolver = resolver
@@ -173,43 +173,53 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
 	}
 
-	server := socks5.NewServer(options...)
-
-	// Попытка создать слушатель с retry (до 5 раз)
-	var listener net.Listener
-	var err error
-	for i := 0; i < 5; i++ {
-		listener, err = net.Listen("tcp", config.BindAddress)
-		if err == nil {
-			break
-		}
-		Log.Warn("Failed to listen, retrying...", "attempt", i+1, "error", err)
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s after retries: %w", config.BindAddress, err)
-	}
-	defer listener.Close()
-
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("SOCKS5 listener goroutine panicked", "recover", r)
-			}
-		}()
-		<-ctx.Done()
-		listener.Close()
-	}()
-
-	if err := server.Serve(listener); err != nil {
+	// Восстанавливаем сервер при ошибках
+	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
-			return fmt.Errorf("SOCKS5 server error: %w", err)
 		}
+
+		server := socks5.NewServer(options...)
+
+		// Попытка создать слушатель с retry (до 5 раз)
+		var listener net.Listener
+		var err error
+		for i := 0; i < 5; i++ {
+			listener, err = net.Listen("tcp", config.BindAddress)
+			if err == nil {
+				break
+			}
+			Log.Warn("Failed to listen, retrying...", "attempt", i+1, "error", err)
+			time.Sleep(2 * time.Second)
+		}
+		if err != nil {
+			Log.Error("Failed to create listener after retries", "error", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Закрываем listener при отмене контекста или при выходе из горутины
+		done := make(chan struct{})
+		go func() {
+			<-ctx.Done()
+			listener.Close()
+			close(done)
+		}()
+
+		Log.Info("SOCKS5 server started", "bind", config.BindAddress)
+		err = server.Serve(listener)
+		// Если контекст отменён – выходим
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Иначе – ошибка, ждём и перезапускаем
+		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
+		listener.Close()
+		<-done
+		time.Sleep(2 * time.Second)
 	}
-	return nil
 }
 
 // SpawnRoutine for HTTPConfig
