@@ -173,7 +173,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
 	}
 
-	// Восстанавливаем сервер при ошибках
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,7 +182,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 
 		server := socks5.NewServer(options...)
 
-		// Попытка создать слушатель с retry (до 5 раз)
 		var listener net.Listener
 		var err error
 		for i := 0; i < 5; i++ {
@@ -193,6 +191,11 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			}
 			Log.Warn("Failed to listen, retrying...", "attempt", i+1, "error", err)
 			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
 		}
 		if err != nil {
 			Log.Error("Failed to create listener after retries", "error", err)
@@ -200,25 +203,23 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			continue
 		}
 
-		// Закрываем listener при отмене контекста или при выходе из горутины
-		done := make(chan struct{})
+		closeChan := make(chan struct{})
 		go func() {
 			<-ctx.Done()
 			listener.Close()
-			close(done)
+			close(closeChan)
 		}()
 
 		Log.Info("SOCKS5 server started", "bind", config.BindAddress)
 		err = server.Serve(listener)
-		// Если контекст отменён – выходим
 		if ctx.Err() != nil {
+			<-closeChan
 			return nil
 		}
-		// Иначе – ошибка, ждём и перезапускаем
 		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
 		listener.Close()
-		<-done
-		time.Sleep(2 * time.Second)
+		<-closeChan
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -343,7 +344,7 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 	}
 }
 
-// tcpClientForward starts a new connection via wireguard and forward traffic from `conn`
+// tcpClientForward – с использованием DialContext и таймаутом
 func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -359,7 +360,10 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
+	dialer := &net.Dialer{
+		Timeout: DialTimeout,
+	}
+	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "error", err)
 		return
@@ -397,7 +401,7 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 }
 
-// STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
+// STDIOTcpForward – аналогично с таймаутом
 func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -418,7 +422,10 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	defer stdout.Close()
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
+	dialer := &net.Dialer{
+		Timeout: DialTimeout,
+	}
+	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "tcpAddr", tcpAddr, "error", err)
 		return
@@ -450,7 +457,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	<-ctx.Done()
 }
 
-// tcpServerForward starts a new connection locally and forward traffic from `conn`
+// tcpServerForward – с таймаутом
 func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -466,7 +473,10 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := net.DialTCP("tcp", nil, tcpAddr)
+	dialer := &net.Dialer{
+		Timeout: DialTimeout,
+	}
+	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Server Tunnel dial error", "target", target, "error", err)
 		return
