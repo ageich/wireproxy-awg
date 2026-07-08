@@ -35,8 +35,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
-const idleTimeout = 5 * time.Minute // таймаут бездействия для TCP-соединений
-
 // errorLogger is the logger to print error message
 var errorLogger = log.New(os.Stderr, "ERROR: ", log.LstdFlags)
 
@@ -415,9 +413,11 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	// Устанавливаем таймаут на чтение для обоих соединений
-	_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
+	// Используем глобальные таймауты
+	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
 	done := make(chan struct{}, 2)
 	go func() {
@@ -459,10 +459,11 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	}
 	defer sconn.Close()
 
-	// Устанавливаем таймаут на чтение для stdout и удалённого соединения.
-	// Для stdin таймаут не устанавливаем, чтобы не прерывать длительное ожидание ввода.
-	_ = stdout.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
+	// Для stdin таймаут не устанавливаем, для stdout и sconn – устанавливаем
+	_ = stdout.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = stdout.SetWriteDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
 	go connForward(os.Stdin, sconn)
 	go connForward(sconn, stdout)
@@ -488,9 +489,10 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	// Устанавливаем таймаут на чтение для обоих соединений
-	_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(idleTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
+	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
 	done := make(chan struct{}, 2)
 	go func() {
