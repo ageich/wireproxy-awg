@@ -82,6 +82,7 @@ func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, erro
 }
 
 // ResolveAddrWithContext resolves a hostname and returns an AddrPort.
+// Использует локальный генератор для перемешивания адресов (избегает глобальной блокировки).
 func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*netip.Addr, error) {
 	addrs, err := d.LookupAddr(ctx, name)
 	if err != nil {
@@ -93,7 +94,9 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 		return nil, errors.New("no address found for: " + name)
 	}
 
-	rand.Shuffle(size, func(i, j int) {
+	// Локальный генератор для перемешивания
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
 	})
 
