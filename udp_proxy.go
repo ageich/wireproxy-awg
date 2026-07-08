@@ -111,7 +111,8 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 
 	if conf.InactivityTimeout > 0 {
 		go func() {
-			ticker := time.NewTicker(10 * time.Second)
+			// Увеличиваем интервал проверки с 10 до 30 секунд для снижения нагрузки
+			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
