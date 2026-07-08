@@ -3,6 +3,7 @@ package wireproxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -64,11 +65,16 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 	defer listener.Close()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Error("UDP listener close goroutine panicked", "recover", r)
+			}
+		}()
 		<-ctx.Done()
 		listener.Close()
 	}()
 
-	errorLogger.Printf("UDPProxyTunnel listening on %s, forwarding to %s", conf.BindAddress, conf.Target)
+	Log.Info("UDPProxyTunnel listening", "bind", conf.BindAddress, "target", conf.Target)
 
 	cacheSize := vt.UdpSessionCacheSize
 	if cacheSize <= 0 {
@@ -93,7 +99,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 	conf.sessions = sessions
 	conf.mu.Unlock()
 
-	var sessionMu sync.RWMutex // теперь позволяет параллельное чтение
+	var sessionMu sync.RWMutex // позволяет параллельное чтение
 
 	removeSession := func(src string, sess *udpSession) {
 		sessionMu.Lock()
@@ -110,6 +116,11 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 
 	if conf.InactivityTimeout > 0 {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Error("UDP inactivity timer goroutine panicked", "recover", r)
+				}
+			}()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -130,7 +141,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 						for _, key := range keys {
 							if sess, ok := currentCache.Get(key); ok {
 								if now.Sub(sess.lastActive) >= inactivityDur {
-									errorLogger.Printf("UDPProxyTunnel: closing inactive session for %s", key)
+									Log.Info("UDPProxyTunnel: closing inactive session", "src", key)
 									currentCache.Remove(key)
 								}
 							}
@@ -187,6 +198,11 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 
 	// Основной цикл чтения из UDP с поддержкой контекста
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Error("UDP read loop goroutine panicked", "recover", r)
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -200,7 +216,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 					case <-ctx.Done():
 						return
 					default:
-						errorLogger.Printf("UDPProxyTunnel: error reading from UDP: %v", err)
+						Log.Error("UDPProxyTunnel: error reading from UDP", "error", err)
 						continue
 					}
 				}
@@ -208,7 +224,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 				srcKey := src.String()
 				s, err := getOrCreateSession(srcKey)
 				if err != nil {
-					errorLogger.Printf("UDPProxyTunnel: getOrCreateSession failed for %s: %v", srcKey, err)
+					Log.Error("UDPProxyTunnel: getOrCreateSession failed", "src", srcKey, "error", err)
 					PutBuffer(buf)
 					continue
 				}
@@ -216,7 +232,7 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 				s.lastActive = time.Now()
 				_, err = s.remoteConn.Write(buf[:n])
 				if err != nil {
-					errorLogger.Printf("UDPProxyTunnel: could not write to remote (%s): %v", conf.Target, err)
+					Log.Error("UDPProxyTunnel: could not write to remote", "target", conf.Target, "error", err)
 				}
 				PutBuffer(buf)
 			}
@@ -229,6 +245,11 @@ func (conf *UDPProxyTunnelConfig) SpawnUDPProxy(ctx context.Context, vt *Virtual
 
 // handleRemoteToLocal читает данные из удалённого соединения и отправляет их обратно локальному клиенту
 func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(ctx context.Context, listener *net.UDPConn, srcAddr string, s *udpSession, removeSession func(string, *udpSession)) {
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Error("UDP handleRemoteToLocal panicked", "src", srcAddr, "recover", r)
+		}
+	}()
 	defer func() {
 		removeSession(srcAddr, s)
 		_ = s.remoteConn.Close()
@@ -257,7 +278,7 @@ func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(ctx context.Context, liste
 					continue
 				}
 			}
-			errorLogger.Printf("UDPProxyTunnel: read error from remote: %v", err)
+			Log.Error("UDPProxyTunnel: read error from remote", "src", srcAddr, "error", err)
 			return
 		}
 
@@ -265,13 +286,13 @@ func (conf *UDPProxyTunnelConfig) handleRemoteToLocal(ctx context.Context, liste
 
 		dstUDPAddr, err := net.ResolveUDPAddr("udp", srcAddr)
 		if err != nil {
-			errorLogger.Printf("UDPProxyTunnel: cannot resolve local address %s: %v", srcAddr, err)
+			Log.Error("UDPProxyTunnel: cannot resolve local address", "src", srcAddr, "error", err)
 			return
 		}
 
 		_, err = listener.WriteToUDP(buf[:n], dstUDPAddr)
 		if err != nil {
-			errorLogger.Printf("UDPProxyTunnel: cannot write to local %s: %v", srcAddr, err)
+			Log.Error("UDPProxyTunnel: cannot write to local", "src", srcAddr, "error", err)
 			return
 		}
 	}
