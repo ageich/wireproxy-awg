@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -154,7 +153,6 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		}
 		defer peer.Close()
 
-		// Используем глобальные константы таймаутов
 		_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 		_ = peer.SetReadDeadline(time.Now().Add(IdleTimeout))
 		_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
@@ -195,7 +193,6 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	}
 }
 
-// ListenAndServe запускает HTTP-прокси с поддержкой graceful shutdown через контекст.
 func (s *HTTPServer) ListenAndServe(ctx context.Context, network, addr string) error {
 	listener, err := net.Listen(network, addr)
 	if err != nil {
@@ -203,7 +200,6 @@ func (s *HTTPServer) ListenAndServe(ctx context.Context, network, addr string) e
 	}
 	defer listener.Close()
 
-	// Закрываем слушатель при отмене контекста
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
