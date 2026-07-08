@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -116,11 +117,17 @@ func (s *HTTPServer) handle(req *http.Request, conn net.Conn) error {
 }
 
 func (s *HTTPServer) serve(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Error("serve panicked", "recover", r)
+		}
+	}()
 	defer conn.Close()
+
 	rd := bufio.NewReader(conn)
 	req, err := http.ReadRequest(rd)
 	if err != nil {
-		errorLogger.Printf("read request failed: %v", err)
+		Log.Error("read request failed", "error", err)
 		return
 	}
 	code, err := s.authenticate(req)
@@ -130,16 +137,16 @@ func (s *HTTPServer) serve(conn net.Conn) {
 			resp.Header.Set("Proxy-Authenticate", "Basic realm=\"Proxy\"")
 		}
 		if writeErr := resp.Write(conn); writeErr != nil {
-			errorLogger.Printf("write auth response failed: %v", writeErr)
+			Log.Error("write auth response failed", "error", writeErr)
 		}
-		errorLogger.Println(err)
+		Log.Error("authentication error", "error", err)
 		return
 	}
 	switch req.Method {
 	case http.MethodConnect:
 		peer, err := s.handleConn(req, conn)
 		if err != nil {
-			errorLogger.Printf("CONNECT failed: %v", err)
+			Log.Error("CONNECT failed", "error", err)
 			if peer != nil {
 				_ = peer.Close()
 			}
@@ -156,10 +163,20 @@ func (s *HTTPServer) serve(conn net.Conn) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Error("CONNECT copy goroutine 1 panicked", "recover", r)
+				}
+			}()
 			defer wg.Done()
 			_, _ = CopyWithPool(conn, peer)
 		}()
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Error("CONNECT copy goroutine 2 panicked", "recover", r)
+				}
+			}()
 			defer wg.Done()
 			_, _ = CopyWithPool(peer, conn)
 		}()
@@ -167,14 +184,14 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodPatch, http.MethodOptions:
 		err = s.handle(req, conn)
 		if err != nil {
-			errorLogger.Printf("HTTP request failed: %v", err)
+			Log.Error("HTTP request failed", "error", err)
 		}
 	default:
 		resp := responseWith(req, http.StatusMethodNotAllowed)
 		if writeErr := resp.Write(conn); writeErr != nil {
-			errorLogger.Printf("write method not allowed response failed: %v", writeErr)
+			Log.Error("write method not allowed response failed", "error", writeErr)
 		}
-		errorLogger.Printf("unsupported method: %s", req.Method)
+		Log.Warn("unsupported method", "method", req.Method)
 	}
 }
 
@@ -188,6 +205,11 @@ func (s *HTTPServer) ListenAndServe(ctx context.Context, network, addr string) e
 
 	// Закрываем слушатель при отмене контекста
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Error("listener close goroutine panicked", "recover", r)
+			}
+		}()
 		<-ctx.Done()
 		listener.Close()
 	}()
