@@ -81,6 +81,11 @@ type Configuration struct {
 	DnsCacheSize        int
 	PingCacheSize       int
 	UdpSessionCacheSize int
+
+	// Флаги, указывающие, были ли эти значения явно заданы в конфиге
+	DnsCacheSizeSet        bool
+	PingCacheSizeSet       bool
+	UdpSessionCacheSizeSet bool
 }
 
 // ---- Вспомогательные функции парсинга ----
@@ -305,7 +310,7 @@ func ParseInterface(cfg *ini.File, device *DeviceConfig) error {
 		device.CheckAliveInterval = value
 	}
 
-	// Валидация AmneziaWG параметров выполняется внутри ParseASecConfig
+	// Валидация AmneziaWG параметров
 	aSecConfig, err := ParseASecConfig(section)
 	if err != nil {
 		return err
@@ -564,25 +569,30 @@ func ParseConfig(path string) (*Configuration, error) {
 		Device:   device,
 		Routines: routinesSpawners,
 		Resolve:  resolve,
+		// Значения по умолчанию для размеров кэшей
 		DnsCacheSize:        1000,
 		PingCacheSize:       500,
 		UdpSessionCacheSize: 500,
 	}
 
+	// Чтение секции [Cache] и установка флагов
 	if cacheSection, err := cfg.GetSection("Cache"); err == nil {
 		if key, err := cacheSection.GetKey("DnsCacheSize"); err == nil {
 			if val, err := key.Int(); err == nil && val > 0 {
 				config.DnsCacheSize = val
+				config.DnsCacheSizeSet = true
 			}
 		}
 		if key, err := cacheSection.GetKey("PingCacheSize"); err == nil {
 			if val, err := key.Int(); err == nil && val > 0 {
 				config.PingCacheSize = val
+				config.PingCacheSizeSet = true
 			}
 		}
 		if key, err := cacheSection.GetKey("UdpSessionCacheSize"); err == nil {
 			if val, err := key.Int(); err == nil && val > 0 {
 				config.UdpSessionCacheSize = val
+				config.UdpSessionCacheSizeSet = true
 			}
 		}
 	}
