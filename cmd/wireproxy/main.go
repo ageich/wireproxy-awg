@@ -33,7 +33,7 @@ var defaultConfigPaths = []string{
 }
 
 // version – переопределяется при сборке через -ldflags
-var version = "1.0.20-dev"
+var version = "1.0.19-dev"
 
 func lock(stage string) error {
 	switch stage {
@@ -449,7 +449,7 @@ func main() {
 	tun.DnsTtl = time.Duration(conf.DnsTtl) * time.Second
 
 	// Запускаем каждый туннель с автоматическим перезапуском при ошибке
-	restartDelay := 5 * time.Second
+	restartDelay := 10 * time.Second
 	for _, spawner := range conf.Routines {
 		go runWithRestart(ctx, spawner, tun, restartDelay)
 	}
