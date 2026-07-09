@@ -33,6 +33,11 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
+var defaultDialer = &net.Dialer{
+	Timeout:   DialTimeout,
+	KeepAlive: 30 * time.Second,
+}
+
 // CredentialValidator stores the authentication data of a socks5 proxy
 type CredentialValidator struct {
 	username string
@@ -94,7 +99,7 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 		return nil, errors.New("no address found for: " + name)
 	}
 
-	// Локальный генератор для перемешивания
+	// Локальный генератор для перемешивания (избегаем глобальной блокировки)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rng.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
@@ -170,7 +175,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithDial(vt.Tnet.DialContext),
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
-		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
+		socks5.WithBufferPool(bufferpool.NewPool(64 * 1024)),
 	}
 
 	for {
@@ -344,6 +349,30 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 	}
 }
 
+// copyBidirectional forwards traffic in both directions and closes both sockets
+// when one side finishes to prevent leaked goroutines.
+// Использует sync.Once для безопасного закрытия соединений.
+func copyBidirectional(a, b net.Conn) {
+	var wg sync.WaitGroup
+	var closeA, closeB sync.Once
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = CopyWithPool(a, b)
+		closeA.Do(func() { a.Close() })
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = CopyWithPool(b, a)
+		closeB.Do(func() { b.Close() })
+	}()
+
+	wg.Wait()
+}
+
 // tcpClientForward – с использованием DialContext и таймаутом
 func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
@@ -360,10 +389,7 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	dialer := &net.Dialer{
-		Timeout: DialTimeout,
-	}
-	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
+	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "error", err)
 		return
@@ -375,29 +401,17 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
-	done := make(chan struct{}, 2)
+	copyDone := make(chan struct{})
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("tcpClientForward copy goroutine 1 panicked", "recover", r)
-			}
-		}()
-		_, _ = CopyWithPool(conn, sconn)
-		done <- struct{}{}
-	}()
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("tcpClientForward copy goroutine 2 panicked", "recover", r)
-			}
-		}()
-		_, _ = CopyWithPool(sconn, conn)
-		done <- struct{}{}
+		copyBidirectional(conn, sconn)
+		close(copyDone)
 	}()
 
 	select {
-	case <-done:
+	case <-copyDone:
 	case <-ctx.Done():
+		_ = conn.Close()
+		_ = sconn.Close()
 	}
 }
 
@@ -422,10 +436,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	defer stdout.Close()
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	dialer := &net.Dialer{
-		Timeout: DialTimeout,
-	}
-	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
+	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "tcpAddr", tcpAddr, "error", err)
 		return
@@ -473,10 +484,7 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	dialer := &net.Dialer{
-		Timeout: DialTimeout,
-	}
-	sconn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
+	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Server Tunnel dial error", "target", target, "error", err)
 		return
@@ -488,29 +496,17 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
-	done := make(chan struct{}, 2)
+	copyDone := make(chan struct{})
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("tcpServerForward copy goroutine 1 panicked", "recover", r)
-			}
-		}()
-		_, _ = CopyWithPool(conn, sconn)
-		done <- struct{}{}
-	}()
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("tcpServerForward copy goroutine 2 panicked", "recover", r)
-			}
-		}()
-		_, _ = CopyWithPool(sconn, conn)
-		done <- struct{}{}
+		copyBidirectional(conn, sconn)
+		close(copyDone)
 	}()
 
 	select {
-	case <-done:
+	case <-copyDone:
 	case <-ctx.Done():
+		_ = conn.Close()
+		_ = sconn.Close()
 	}
 }
 
