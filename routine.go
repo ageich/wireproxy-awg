@@ -6,7 +6,6 @@ import (
 	srand "crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
