@@ -11,7 +11,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // DeviceSetting contains the parameters for setting up a tun interface
@@ -168,8 +167,8 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	return setting, nil
 }
 
-// StartWireguard creates a tun interface on netstack given a configuration.
-// pingCacheSize задаёт максимальное количество записей в кэше PingRecord (LRU).
+// StartWireguard создаёт WireGuard-интерфейс.
+// Параметр pingCacheSize сохранён для обратной совместимости, но не используется.
 func StartWireguard(conf *DeviceConfig, logLevel int, pingCacheSize int) (*VirtualTun, error) {
 	setting, err := CreateIPCRequest(conf)
 	if err != nil {
@@ -191,17 +190,11 @@ func StartWireguard(conf *DeviceConfig, logLevel int, pingCacheSize int) (*Virtu
 		return nil, err
 	}
 
-	// Создаём LRU-кэш для хранения времени последнего успешного ping-а
-	pingCache, err := lru.New[string, uint64](pingCacheSize)
-	if err != nil {
-		return nil, err
-	}
-
 	return &VirtualTun{
 		Tnet:       tnet,
 		Dev:        dev,
 		Conf:       conf,
 		SystemDNS:  len(setting.DNS) == 0,
-		PingRecord: pingCache,
+		PingRecord: nil, // инициализируется позже в StartPingIPs()
 	}, nil
 }
