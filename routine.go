@@ -38,6 +38,8 @@ var defaultDialer = &net.Dialer{
 	KeepAlive: 30 * time.Second,
 }
 
+var socksPool = bufferpool.NewPool(64 * 1024)
+
 // CredentialValidator stores the authentication data of a socks5 proxy
 type CredentialValidator struct {
 	username string
@@ -175,7 +177,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithDial(vt.Tnet.DialContext),
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
-		socks5.WithBufferPool(bufferpool.NewPool(64 * 1024)),
+		socks5.WithBufferPool(socksPool),
 	}
 
 	for {
