@@ -9,11 +9,8 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 	"github.com/hashicorp/golang-lru/v2/expirable"
-	"github.com/miekg/dns"
 )
 
-// fixedResolver реализует socks5.NameResolver с LRU-кэшем и фиксированным TTL.
-// Сначала пытается использовать системный DNS, при ошибке – внешний (1.1.1.1).
 type fixedResolver struct {
 	tnet       *netstack.Net
 	systemDNS  bool
@@ -22,7 +19,6 @@ type fixedResolver struct {
 	mu         sync.RWMutex
 }
 
-// NewFixedResolver создаёт новый резолвер.
 func NewFixedResolver(tnet *netstack.Net, systemDNS bool, defaultTTL time.Duration, cacheSize int) *fixedResolver {
 	cache := expirable.NewLRU[string, net.IP](cacheSize, nil, defaultTTL)
 	return &fixedResolver{
@@ -33,7 +29,6 @@ func NewFixedResolver(tnet *netstack.Net, systemDNS bool, defaultTTL time.Durati
 	}
 }
 
-// SetCacheSize изменяет размер кэша.
 func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -58,7 +53,6 @@ func (r *fixedResolver) SetCacheSize(newSize int) {
 	r.cache = newCache
 }
 
-// Resolve выполняет DNS-запрос.
 func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	r.mu.RLock()
 	ip, ok := r.cache.Get(name)
@@ -85,37 +79,15 @@ func (r *fixedResolver) Resolve(ctx context.Context, name string) (context.Conte
 	return ctx, ipNet, nil
 }
 
-// resolveSystemDNS – гибрид: сначала системный DNS, при ошибке – внешний 1.1.1.1.
+// Используем системный резолвер (уважает /etc/resolv.conf)
 func (r *fixedResolver) resolveSystemDNS(ctx context.Context, name string) (net.IP, error) {
-	// 1. Пробуем системный резолвер
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
-	if err == nil && len(ips) > 0 {
-		return ips[0], nil
-	}
-
-	// 2. При ошибке – внешний DNS (1.1.1.1)
-	c := new(dns.Client)
-	c.Timeout = 5 * time.Second // таймаут 5 секунд
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
-	m.RecursionDesired = true
-
-	resp, _, err := c.ExchangeContext(ctx, m, "1.1.1.1:53")
-	if err != nil {
+	if err != nil || len(ips) == 0 {
 		return nil, err
 	}
-	if len(resp.Answer) == 0 {
-		return nil, errors.New("no A record found")
-	}
-	for _, ans := range resp.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			return a.A, nil
-		}
-	}
-	return nil, errors.New("no A record")
+	return ips[0], nil
 }
 
-// resolveOverTun использует туннельный резолвер.
 func (r *fixedResolver) resolveOverTun(ctx context.Context, name string) (net.IP, error) {
 	addrs, err := r.tnet.LookupContextHost(ctx, name)
 	if err != nil || len(addrs) == 0 {
@@ -128,5 +100,4 @@ func (r *fixedResolver) resolveOverTun(ctx context.Context, name string) (net.IP
 	return ip, nil
 }
 
-// Stop – no-op.
 func (r *fixedResolver) Stop() {}
