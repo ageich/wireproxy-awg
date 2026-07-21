@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -121,10 +122,17 @@ func extractPort(addr string) (uint16, error) {
 	return uint16(port), nil
 }
 
-func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string) error {
+func lockNetwork(sections []wireproxyawg.RoutineSpawner, infoAddr *string, pprofAddr *string) error {
 	var rules []landlock.Rule
 	if infoAddr != nil && *infoAddr != "" {
 		port, err := extractPort(*infoAddr)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, landlock.BindTCP(port))
+	}
+	if pprofAddr != nil && *pprofAddr != "" {
+		port, err := extractPort(*pprofAddr)
 		if err != nil {
 			return err
 		}
@@ -169,32 +177,28 @@ func parseSize(s string) (int64, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty size string")
 	}
-
 	var multiplier int64 = 1
 	lower := strings.ToLower(s)
-
 	switch {
 	case strings.HasSuffix(lower, "kib"):
 		multiplier = 1024
-		s = s[:len(s)-3] // удаляем "KiB" (3 символа)
+		s = s[:len(s)-3]
 	case strings.HasSuffix(lower, "mib"):
 		multiplier = 1024 * 1024
-		s = s[:len(s)-3] // "MiB" - 3 символа
+		s = s[:len(s)-3]
 	case strings.HasSuffix(lower, "gib"):
 		multiplier = 1024 * 1024 * 1024
-		s = s[:len(s)-3] // "GiB" - 3 символа
+		s = s[:len(s)-3]
 	case strings.HasSuffix(lower, "kb"):
 		multiplier = 1000
-		s = s[:len(s)-2] // "KB" - 2 символа
+		s = s[:len(s)-2]
 	case strings.HasSuffix(lower, "mb"):
 		multiplier = 1000 * 1000
-		s = s[:len(s)-2] // "MB" - 2 символа
+		s = s[:len(s)-2]
 	case strings.HasSuffix(lower, "gb"):
 		multiplier = 1000 * 1000 * 1000
-		s = s[:len(s)-2] // "GB" - 2 символа
+		s = s[:len(s)-2]
 	}
-
-	// Парсим числовую часть (уже без суффикса)
 	val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid number format: %w", err)
@@ -218,18 +222,13 @@ func setMemoryLimitFromEnvAndFlags(memlimitFlag *int) (int64, error) {
 	}
 	if limitBytes > 0 {
 		debug.SetMemoryLimit(limitBytes)
-		slog.Info("Memory limit set",
-			"bytes", limitBytes,
-			"mb", limitBytes/(1024*1024),
-			"gib", float64(limitBytes)/(1024*1024*1024),
-		)
+		slog.Info("Memory limit set", "bytes", limitBytes, "mb", limitBytes/(1024*1024), "gib", float64(limitBytes)/(1024*1024*1024))
 	} else {
 		slog.Info("No memory limit set (use GOMEMLIMIT env or --max-memory flag)")
 	}
 	return limitBytes, nil
 }
 
-// adjustCacheSizes пересчитывает размеры кэшей, если они не были заданы явно.
 func adjustCacheSizes(conf *wireproxyawg.Configuration, limitBytes int64) {
 	if limitBytes <= 0 {
 		return
@@ -238,11 +237,9 @@ func adjustCacheSizes(conf *wireproxyawg.Configuration, limitBytes int64) {
 	dns := int(float64(total) * 0.30 / 64)
 	ping := int(float64(total) * 0.10 / 8)
 	udp := int(float64(total) * 0.60 / 1024)
-
 	const minDns = 100
 	const minPing = 50
 	const minUdp = 100
-
 	if !conf.DnsCacheSizeSet {
 		if dns < minDns {
 			dns = minDns
@@ -266,7 +263,6 @@ func adjustCacheSizes(conf *wireproxyawg.Configuration, limitBytes int64) {
 	}
 }
 
-// startMemoryMonitor запускает периодическую очистку памяти.
 func startMemoryMonitor(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -284,7 +280,6 @@ func startMemoryMonitor(ctx context.Context, interval time.Duration) {
 	}()
 }
 
-// runWithRestart запускает spawner.SpawnRoutine в бесконечном цикле, перезапуская при ошибке.
 func runWithRestart(ctx context.Context, spawner wireproxyawg.RoutineSpawner, tun *wireproxyawg.VirtualTun, restartDelay time.Duration) {
 	for {
 		select {
@@ -303,7 +298,6 @@ func runWithRestart(ctx context.Context, spawner wireproxyawg.RoutineSpawner, tu
 }
 
 func main() {
-	// Инициализация логирования
 	wireproxyawg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	parser := argparse.NewParser("wireproxy", "Userspace wireguard client for proxying")
@@ -315,6 +309,7 @@ func main() {
 	configTest := parser.Flag("n", "configtest", &argparse.Options{Help: "Configtest mode. Only check the configuration file for validity."})
 	memlimit := parser.Int("", "max-memory", &argparse.Options{Help: "Set maximum memory limit in megabytes (overrides GOMEMLIMIT env if set)"})
 	logLevelFlag := parser.String("", "log-level", &argparse.Options{Help: "Log level (debug, info, warn, error)", Default: "info"})
+	pprofAddr := parser.String("", "pprof", &argparse.Options{Help: "Enable pprof HTTP server on specified address (e.g., localhost:6060)"})
 
 	err := parser.Parse(os.Args)
 	if err != nil {
@@ -330,7 +325,15 @@ func main() {
 		wireproxyawg.SetLogLevel("error")
 	}
 
-	// Основной контекст – без таймаута
+	if *pprofAddr != "" {
+		go func() {
+			slog.Info("Starting pprof server", "addr", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				slog.Error("pprof server error", "error", err)
+			}
+		}()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -388,7 +391,7 @@ func main() {
 		return
 	}
 
-	if err := lockNetwork(conf.Routines, info); err != nil {
+	if err := lockNetwork(conf.Routines, info, pprofAddr); err != nil {
 		slog.Error("Lock network failed", "error", err)
 		os.Exit(1)
 	}
