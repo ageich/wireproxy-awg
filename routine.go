@@ -340,7 +340,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 	return conf.SpawnUDPProxy(ctx, vt)
 }
 
-// ---------- Копирование данных с CloseRead/CloseWrite ----------
+// ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
 
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
@@ -350,8 +350,8 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		// Копируем из a в b
-		_, _ = io.Copy(b, a)
+		// Копируем из a в b с использованием пула буферов
+		_, _ = CopyWithPool(b, a)
 		// Закрываем сторону записи b, чтобы завершить чтение на другой стороне
 		closeB.Do(func() {
 			if tcpConn, ok := b.(*net.TCPConn); ok {
@@ -371,8 +371,8 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		// Копируем из b в a
-		_, _ = io.Copy(a, b)
+		// Копируем из b в a с использованием пула буферов
+		_, _ = CopyWithPool(a, b)
 		// Закрываем сторону записи a
 		closeA.Do(func() {
 			if tcpConn, ok := a.(*net.TCPConn); ok {
@@ -535,7 +535,8 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 				Log.Error("STDIOTcpForward copy goroutine 1 panicked", "recover", r)
 			}
 		}()
-		_, _ = io.Copy(sconn, os.Stdin)
+		// Используем CopyWithPool вместо io.Copy
+		_, _ = CopyWithPool(sconn, os.Stdin)
 	}()
 	go func() {
 		defer func() {
@@ -543,7 +544,8 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 				Log.Error("STDIOTcpForward copy goroutine 2 panicked", "recover", r)
 			}
 		}()
-		_, _ = io.Copy(stdout, sconn)
+		// Используем CopyWithPool вместо io.Copy
+		_, _ = CopyWithPool(stdout, sconn)
 	}()
 
 	<-ctx.Done()
