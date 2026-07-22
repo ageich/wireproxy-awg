@@ -5,10 +5,7 @@ import (
 	"sync"
 )
 
-const (
-	defaultBufferSize = 64 * 1024 // 64KB
-	maxBufferCap      = 4096      // максимальный разумный размер буфера для возврата в пул
-)
+const defaultBufferSize = 64 * 1024 // 64KB
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
@@ -22,24 +19,17 @@ func GetBuffer() []byte {
 }
 
 // PutBuffer возвращает буфер обратно в пул.
-// Если ёмкость буфера превышает maxBufferCap (4096 байт), буфер не возвращается в пул,
-// чтобы GC мог его удалить и освободить память.
-// Также проверяется, что буфер не nil.
+// Буфер обрезается до defaultBufferSize, чтобы избежать удержания больших ёмкостей.
 func PutBuffer(buf []byte) {
 	if buf == nil {
 		return
 	}
-	// Если ёмкость превышает лимит — не возвращаем в пул
-	if cap(buf) > maxBufferCap {
-		return
+	// Обрезаем буфер до defaultBufferSize, если он больше
+	if cap(buf) > defaultBufferSize {
+		bufferPool.Put(buf[:defaultBufferSize])
+	} else {
+		bufferPool.Put(buf[:cap(buf)])
 	}
-	// Если буфер меньше defaultBufferSize, создаём новый
-	if cap(buf) < defaultBufferSize {
-		bufferPool.Put(make([]byte, defaultBufferSize))
-		return
-	}
-	// Возвращаем буфер в пул (обрезаем до defaultBufferSize)
-	bufferPool.Put(buf[:defaultBufferSize])
 }
 
 // CopyWithPool копирует данные из src в dst, используя буфер из пула
