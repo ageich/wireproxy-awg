@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -350,9 +349,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		// Копируем из a в b с использованием пула буферов
 		_, _ = CopyWithPool(b, a)
-		// Закрываем сторону записи b, чтобы завершить чтение на другой стороне
 		closeB.Do(func() {
 			if tcpConn, ok := b.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
@@ -371,9 +368,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		// Копируем из b в a с использованием пула буферов
 		_, _ = CopyWithPool(a, b)
-		// Закрываем сторону записи a
 		closeA.Do(func() {
 			if tcpConn, ok := a.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
@@ -403,7 +398,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	// Захватываем семафор
 	select {
 	case tcpSemaphore <- struct{}{}:
 		defer func() { <-tcpSemaphore }()
@@ -535,7 +529,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 				Log.Error("STDIOTcpForward copy goroutine 1 panicked", "recover", r)
 			}
 		}()
-		// Используем CopyWithPool вместо io.Copy
 		_, _ = CopyWithPool(sconn, os.Stdin)
 	}()
 	go func() {
@@ -544,7 +537,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 				Log.Error("STDIOTcpForward copy goroutine 2 panicked", "recover", r)
 			}
 		}()
-		// Используем CopyWithPool вместо io.Copy
 		_, _ = CopyWithPool(stdout, sconn)
 	}()
 
@@ -558,9 +550,8 @@ func (d *VirtualTun) initPingWorkers() {
 		return
 	}
 	d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
-	d.pingJobs = make(chan pingJob, 10) // буфер
+	d.pingJobs = make(chan pingJob, 10)
 
-	// Запускаем 5 воркеров
 	for i := 0; i < 5; i++ {
 		d.pingWorkers.Add(1)
 		go d.pingWorker()
@@ -655,7 +646,6 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 			return
 		}
 	}
-	// Сохраняем время успешного пинга (автоматически вытеснится по TTL)
 	d.PingRecord.Add(addr.String(), uint64(time.Now().Unix()))
 }
 
@@ -692,7 +682,6 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	Log.Info("Health metric request", "path", r.URL.Path)
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
-		// Оптимизация: проверяем только статус, не создаём map и json
 		now := time.Now()
 		ok := true
 		for _, key := range d.PingRecord.Keys() {
@@ -747,7 +736,6 @@ func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
-	// Инициализация PingRecord как expirable.LRU с TTL = CheckAliveInterval + 2 секунды
 	ttl := time.Duration(d.Conf.CheckAliveInterval+2) * time.Second
 	if d.PingRecord == nil {
 		d.PingRecord = expirable.NewLRU[string, uint64](d.DnsCacheSize, nil, ttl)
@@ -769,7 +757,6 @@ func (d *VirtualTun) StartPingIPs() {
 				Log.Error("StartPingIPs goroutine panicked", "recover", r)
 			}
 		}()
-		// Сразу запускаем один цикл
 		d.pingIPs()
 		ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
 		defer ticker.Stop()
