@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-const defaultBufferSize = 64 * 1024 // 64KB
+const defaultBufferSize = 128 * 1024 // 128KB – увеличен для больших пакетов
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
@@ -18,13 +18,11 @@ func GetBuffer() []byte {
 	return bufferPool.Get().([]byte)
 }
 
-// PutBuffer возвращает буфер обратно в пул.
-// Буфер обрезается до defaultBufferSize, чтобы избежать удержания больших ёмкостей.
+// PutBuffer возвращает буфер обратно в пул, обрезая до defaultBufferSize
 func PutBuffer(buf []byte) {
 	if buf == nil {
 		return
 	}
-	// Обрезаем буфер до defaultBufferSize, если он больше
 	if cap(buf) > defaultBufferSize {
 		bufferPool.Put(buf[:defaultBufferSize])
 	} else {
