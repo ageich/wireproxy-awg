@@ -340,6 +340,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 }
 
 // ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
+// ИСПРАВЛЕНО: io.Copy заменён на CopyWithPool
 
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
@@ -349,7 +350,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = CopyWithPool(b, a)
+		_, _ = CopyWithPool(b, a) // <-- исправлено
 		closeB.Do(func() {
 			if tcpConn, ok := b.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
@@ -368,7 +369,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = CopyWithPool(a, b)
+		_, _ = CopyWithPool(a, b) // <-- исправлено
 		closeA.Do(func() {
 			if tcpConn, ok := a.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
