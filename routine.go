@@ -41,7 +41,7 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
-var tcpSemaphore = make(chan struct{}, 100) // максимум 100 соединений
+var tcpSemaphore = make(chan struct{}, 100)
 
 // Пул для ICMP-буферов
 var icmpBufPool = sync.Pool{
@@ -124,7 +124,6 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	if size == 0 {
 		return nil, errors.New("no address found for: " + name)
 	}
-	// Локальный генератор для перемешивания
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rng.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
@@ -340,7 +339,6 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 }
 
 // ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
-// ИСПРАВЛЕНО: io.Copy заменён на CopyWithPool
 
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
@@ -350,7 +348,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = CopyWithPool(b, a) // <-- исправлено
+		_, _ = CopyWithPool(b, a)
 		closeB.Do(func() {
 			if tcpConn, ok := b.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
@@ -369,7 +367,7 @@ func copyBidirectional(a, b net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = CopyWithPool(a, b) // <-- исправлено
+		_, _ = CopyWithPool(a, b)
 		closeA.Do(func() {
 			if tcpConn, ok := a.(*net.TCPConn); ok {
 				_ = tcpConn.CloseWrite()
@@ -515,7 +513,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "tcpAddr", tcpAddr, "error", err)
-		return
 	}
 	defer sconn.Close()
 
