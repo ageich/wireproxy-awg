@@ -41,13 +41,43 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
-var tcpSemaphore = make(chan struct{}, 100)
+var tcpSemaphore = make(chan struct{}, 100) // максимум 100 соединений
 
 // Пул для ICMP-буферов
 var icmpBufPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 16)
 	},
+}
+
+// ---------- timeoutConn обёртка с таймаутами ----------
+
+// timeoutConn оборачивает net.Conn и устанавливает таймауты на чтение/запись
+type timeoutConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *timeoutConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(p)
+}
+
+func (c *timeoutConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(p)
+}
+
+// dialWithTimeout создаёт соединение через vt.Tnet.DialContext и оборачивает его в timeoutConn
+func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) (net.Conn, error) {
+	conn, err := vt.Tnet.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &timeoutConn{
+		Conn: conn,
+		idle: IdleTimeout, // используем глобальную константу
+	}, nil
 }
 
 // ---------- CredentialValidator ----------
@@ -124,6 +154,7 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	if size == 0 {
 		return nil, errors.New("no address found for: " + name)
 	}
+	// Локальный генератор для перемешивания
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rng.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
@@ -185,8 +216,13 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
 	}
 
+	// Обёртка для Dial с таймаутами
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialWithTimeout(ctx, network, addr, vt)
+	}
+
 	options := []socks5.Option{
-		socks5.WithDial(vt.Tnet.DialContext),
+		socks5.WithDial(dial), // используем обёртку вместо vt.Tnet.DialContext
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
@@ -513,6 +549,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "tcpAddr", tcpAddr, "error", err)
+		return
 	}
 	defer sconn.Close()
 
