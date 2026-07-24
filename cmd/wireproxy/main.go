@@ -34,7 +34,7 @@ var defaultConfigPaths = []string{
 }
 
 // version – переопределяется при сборке через -ldflags
-var version = "1.0.24-test"
+var version = "1.0.25-test"
 
 func lock(stage string) error {
 	switch stage {
