@@ -41,7 +41,7 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
-var tcpSemaphore = make(chan struct{}, 100) // максимум 100 соединений
+var tcpSemaphore = make(chan struct{}, 100)
 
 // Пул для ICMP-буферов
 var icmpBufPool = sync.Pool{
@@ -68,6 +68,13 @@ func (c *timeoutConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+// Close сбрасывает дедлайн перед закрытием, чтобы разбудить блокирующие вызовы
+func (c *timeoutConn) Close() error {
+	_ = c.Conn.SetReadDeadline(time.Now())
+	_ = c.Conn.SetWriteDeadline(time.Now())
+	return c.Conn.Close()
+}
+
 // dialWithTimeout создаёт соединение через vt.Tnet.DialContext и оборачивает его в timeoutConn
 func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) (net.Conn, error) {
 	conn, err := vt.Tnet.DialContext(ctx, network, addr)
@@ -76,7 +83,24 @@ func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) 
 	}
 	return &timeoutConn{
 		Conn: conn,
-		idle: IdleTimeout, // используем глобальную константу
+		idle: IdleTimeout,
+	}, nil
+}
+
+// timeoutListener оборачивает net.Listener и возвращает timeoutConn для каждого принятого соединения
+type timeoutListener struct {
+	net.Listener
+	idle time.Duration
+}
+
+func (l *timeoutListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &timeoutConn{
+		Conn: conn,
+		idle: l.idle,
 	}, nil
 }
 
@@ -101,19 +125,15 @@ type VirtualTun struct {
 	SystemDNS bool
 	Conf      *DeviceConfig
 
-	// PingRecord — expirable.LRU с автоматическим удалением записей по TTL
 	PingRecord *expirable.LRU[string, uint64]
 
-	// pingStop для остановки фоновой горутины
 	pingStop   chan struct{}
 	pingStopMu sync.Mutex
 
-	// Размеры кэшей
 	DnsCacheSize        int
 	UdpSessionCacheSize int
 	DnsTtl              time.Duration
 
-	// Worker pool для ICMP-пингов
 	pingJobs    chan pingJob
 	pingWorkers sync.WaitGroup
 	pingCtx     context.Context
@@ -154,7 +174,6 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	if size == 0 {
 		return nil, errors.New("no address found for: " + name)
 	}
-	// Локальный генератор для перемешивания
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rng.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
@@ -216,13 +235,12 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
 	}
 
-	// Обёртка для Dial с таймаутами
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return dialWithTimeout(ctx, network, addr, vt)
 	}
 
 	options := []socks5.Option{
-		socks5.WithDial(dial), // используем обёртку вместо vt.Tnet.DialContext
+		socks5.WithDial(dial),
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
@@ -236,31 +254,24 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		}
 
 		server := socks5.NewServer(options...)
-		var listener net.Listener
-		var err error
-		for i := 0; i < 5; i++ {
-			listener, err = net.Listen("tcp", config.BindAddress)
-			if err == nil {
-				break
-			}
-			Log.Warn("Failed to listen, retrying...", "attempt", i+1, "error", err)
-			time.Sleep(2 * time.Second)
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-		}
+
+		rawListener, err := net.Listen("tcp", config.BindAddress)
 		if err != nil {
-			Log.Error("Failed to create listener after retries", "error", err)
+			Log.Error("Failed to listen", "error", err)
 			time.Sleep(5 * time.Second)
 			continue
+		}
+
+		// Оборачиваем listener, чтобы обернуть входящие соединения
+		listener := &timeoutListener{
+			Listener: rawListener,
+			idle:     IdleTimeout,
 		}
 
 		closeChan := make(chan struct{})
 		go func() {
 			<-ctx.Done()
-			listener.Close()
+			rawListener.Close()
 			close(closeChan)
 		}()
 
@@ -271,7 +282,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			return nil
 		}
 		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
-		listener.Close()
+		rawListener.Close()
 		<-closeChan
 		time.Sleep(5 * time.Second)
 	}
