@@ -3,25 +3,25 @@ module github.com/ageich/wireproxy-awg
 go 1.26
 
 require (
-github.com/MakeNowJust/heredoc/v2 v2.0.1
-github.com/akamensky/argparse v1.4.0
-github.com/amnezia-vpn/amneziawg-go v0.2.19
-github.com/go-ini/ini v1.67.0
-github.com/hashicorp/golang-lru/v2 v2.0.7
-github.com/landlock-lsm/go-landlock v0.6.0
-github.com/things-go/go-socks5 v0.1.1
-golang.org/x/net v0.47.0
-suah.dev/protect v1.2.4
+	github.com/MakeNowJust/heredoc/v2 v2.0.1
+	github.com/akamensky/argparse v1.4.0
+	github.com/amnezia-vpn/amneziawg-go v0.2.19
+	github.com/go-ini/ini v1.67.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/landlock-lsm/go-landlock v0.6.0
+	github.com/things-go/go-socks5 v0.1.1
+	golang.org/x/net v0.47.0
+	suah.dev/protect v1.2.4
 )
 
 replace github.com/things-go/go-socks5 => github.com/ageich/go-socks5 v0.1.2-0.20260811141544-da15a50bca75
 
 require (
-github.com/google/btree v1.1.3 // indirect
-golang.org/x/crypto v0.45.0 // indirect
-golang.org/x/sys v0.40.0 // indirect
-golang.org/x/time v0.9.0 // indirect
-golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
-gvisor.dev/gvisor v0.0.0-20250718015824-35000683b6d7 // indirect
-kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
+	github.com/google/btree v1.1.3 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/time v0.9.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	gvisor.dev/gvisor v0.0.0-20250718015824-35000683b6d7 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )
