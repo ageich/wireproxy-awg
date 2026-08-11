@@ -50,26 +50,39 @@ var icmpBufPool = sync.Pool{
 	},
 }
 
-// ---------- timeoutConn обёртка с таймаутами ----------
+// ---------- timeoutConn с кэшированием дедлайна ----------
 
-// timeoutConn оборачивает net.Conn и устанавливает таймауты на чтение/запись
 type timeoutConn struct {
 	net.Conn
-	idle time.Duration
+	idle           time.Duration
+	readDeadline   time.Time
+	writeDeadline  time.Time
+	mu             sync.Mutex
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	c.mu.Lock()
+	// Обновляем дедлайн, если он не установлен или скоро истечёт
+	if c.readDeadline.IsZero() || time.Now().After(c.readDeadline.Add(-c.idle/10)) {
+		c.readDeadline = time.Now().Add(c.idle)
+		_ = c.Conn.SetReadDeadline(c.readDeadline)
+	}
+	c.mu.Unlock()
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	c.mu.Lock()
+	if c.writeDeadline.IsZero() || time.Now().After(c.writeDeadline.Add(-c.idle/10)) {
+		c.writeDeadline = time.Now().Add(c.idle)
+		_ = c.Conn.SetWriteDeadline(c.writeDeadline)
+	}
+	c.mu.Unlock()
 	return c.Conn.Write(p)
 }
 
-// Close сбрасывает дедлайн перед закрытием, чтобы разбудить блокирующие вызовы
 func (c *timeoutConn) Close() error {
+	// Сбрасываем дедлайн, чтобы разбудить блокирующие вызовы
 	_ = c.Conn.SetReadDeadline(time.Now())
 	_ = c.Conn.SetWriteDeadline(time.Now())
 	return c.Conn.Close()
@@ -262,7 +275,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			continue
 		}
 
-		// Оборачиваем listener, чтобы обернуть входящие соединения
 		listener := &timeoutListener{
 			Listener: rawListener,
 			idle:     IdleTimeout,
