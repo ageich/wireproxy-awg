@@ -11,7 +11,6 @@ require (
 	github.com/landlock-lsm/go-landlock v0.6.0
 	github.com/things-go/go-socks5 v0.1.1
 	golang.org/x/net v0.47.0
-	gvisor.dev/gvisor v0.0.0-20250718015824-35000683b6d7
 	suah.dev/protect v1.2.4
 )
 
@@ -21,5 +20,6 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	gvisor.dev/gvisor v0.0.0-20250718015824-35000683b6d7 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )
