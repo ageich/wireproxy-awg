@@ -1,6 +1,7 @@
 package wireproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	srand "crypto/rand"
@@ -13,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/device"
@@ -41,13 +44,37 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
-var tcpSemaphore = make(chan struct{}, 100)
+// Рассчитываем на основе количества CPU для лучшей масштабируемости
+var tcpSemaphore = make(chan struct{}, runtime.GOMAXPROCS(0)*256)
 
-// Пул для ICMP-буферов
-var icmpBufPool = sync.Pool{
+// ---------- DNS перемешивание ----------
+
+var (
+	dnsRand   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	dnsRandMu sync.Mutex
+)
+
+// ---------- ICMP read buffer pool ----------
+
+var icmpReadPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 16)
+		b := make([]byte, 128)
+		return &b
 	},
+}
+
+// ---------- ICMP sequence generator ----------
+
+var pingSeq uint32
+
+// ---------- Интерфейсы для half-close ----------
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type closeReader interface {
+	CloseRead() error
 }
 
 // ---------- timeoutConn с кэшированием дедлайна ----------
@@ -62,7 +89,6 @@ type timeoutConn struct {
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
-	// Обновляем дедлайн, если он не установлен или скоро истечёт
 	if c.readDeadline.IsZero() || time.Now().After(c.readDeadline.Add(-c.idle/10)) {
 		c.readDeadline = time.Now().Add(c.idle)
 		_ = c.Conn.SetReadDeadline(c.readDeadline)
@@ -82,7 +108,6 @@ func (c *timeoutConn) Write(p []byte) (int, error) {
 }
 
 func (c *timeoutConn) Close() error {
-	// Сбрасываем дедлайн, чтобы разбудить блокирующие вызовы
 	_ = c.Conn.SetReadDeadline(time.Now())
 	_ = c.Conn.SetWriteDeadline(time.Now())
 	return c.Conn.Close()
@@ -142,6 +167,7 @@ type VirtualTun struct {
 
 	pingStop   chan struct{}
 	pingStopMu sync.Mutex
+	pingLoopWg sync.WaitGroup // для ожидания завершения ping-горутины
 
 	DnsCacheSize        int
 	UdpSessionCacheSize int
@@ -187,10 +213,13 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	if size == 0 {
 		return nil, errors.New("no address found for: " + name)
 	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rng.Shuffle(size, func(i, j int) {
+	// Используем глобальный PRNG с мьютексом вместо создания нового на каждый вызов
+	dnsRandMu.Lock()
+	dnsRand.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
 	})
+	dnsRandMu.Unlock()
+
 	var addr netip.Addr
 	for _, saddr := range addrs {
 		addr, err = netip.ParseAddr(saddr)
@@ -259,14 +288,15 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithBufferPool(socksPool),
 	}
 
+	// Создаём server один раз, а не при каждой итерации
+	server := socks5.NewServer(options...)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-
-		server := socks5.NewServer(options...)
 
 		rawListener, err := net.Listen("tcp", config.BindAddress)
 		if err != nil {
@@ -398,6 +428,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 }
 
 // ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
+// Универсальный half-close через интерфейсы
 
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
@@ -408,16 +439,18 @@ func copyBidirectional(a, b net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = CopyWithPool(b, a)
+		// Закрываем сторону записи b
 		closeB.Do(func() {
-			if tcpConn, ok := b.(*net.TCPConn); ok {
-				_ = tcpConn.CloseWrite()
+			if cw, ok := b.(closeWriter); ok {
+				_ = cw.CloseWrite()
 			} else {
 				_ = b.Close()
 			}
 		})
+		// Закрываем сторону чтения a
 		closeA.Do(func() {
-			if tcpConn, ok := a.(*net.TCPConn); ok {
-				_ = tcpConn.CloseRead()
+			if cr, ok := a.(closeReader); ok {
+				_ = cr.CloseRead()
 			} else {
 				_ = a.Close()
 			}
@@ -427,16 +460,18 @@ func copyBidirectional(a, b net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = CopyWithPool(a, b)
+		// Закрываем сторону записи a
 		closeA.Do(func() {
-			if tcpConn, ok := a.(*net.TCPConn); ok {
-				_ = tcpConn.CloseWrite()
+			if cw, ok := a.(closeWriter); ok {
+				_ = cw.CloseWrite()
 			} else {
 				_ = a.Close()
 			}
 		})
+		// Закрываем сторону чтения b
 		closeB.Do(func() {
-			if tcpConn, ok := b.(*net.TCPConn); ok {
-				_ = tcpConn.CloseRead()
+			if cr, ok := b.(closeReader); ok {
+				_ = cr.CloseRead()
 			} else {
 				_ = b.Close()
 			}
@@ -481,18 +516,7 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
-	copyDone := make(chan struct{})
-	go func() {
-		copyBidirectional(conn, sconn)
-		close(copyDone)
-	}()
-
-	select {
-	case <-copyDone:
-	case <-ctx.Done():
-		_ = conn.Close()
-		_ = sconn.Close()
-	}
+	copyBidirectional(conn, sconn)
 }
 
 func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
@@ -528,18 +552,7 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
-	copyDone := make(chan struct{})
-	go func() {
-		copyBidirectional(conn, sconn)
-		close(copyDone)
-	}()
-
-	select {
-	case <-copyDone:
-	case <-ctx.Done():
-		_ = conn.Close()
-		_ = sconn.Close()
-	}
+	copyBidirectional(conn, sconn)
 }
 
 func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
@@ -601,16 +614,34 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	<-ctx.Done()
 }
 
-// ---------- ICMP ping с worker pool ----------
+// ---------- ICMP ping с worker pool (исправленный) ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	if d.pingJobs != nil {
-		return
+		// если канал уже существует, проверяем, не закрыт ли он
+		// если закрыт – пересоздаём
+		select {
+		case _, ok := <-d.pingJobs:
+			if !ok {
+				// канал закрыт – создаём новый
+				d.pingJobs = nil
+			}
+		default:
+			// канал открыт – возвращаемся
+			return
+		}
 	}
-	d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
-	d.pingJobs = make(chan pingJob, 10)
 
-	for i := 0; i < 5; i++ {
+	// если канал nil или закрыт, создаём новый
+	d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		workers = 2
+	}
+	queueSize := workers * 16
+	d.pingJobs = make(chan pingJob, queueSize)
+
+	for i := 0; i < workers; i++ {
 		d.pingWorkers.Add(1)
 		go d.pingWorker()
 	}
@@ -634,11 +665,15 @@ func (d *VirtualTun) pingWorker() {
 func (d *VirtualTun) stopPingWorkers() {
 	if d.pingCancel != nil {
 		d.pingCancel()
+		d.pingCancel = nil
 	}
 	if d.pingJobs != nil {
 		close(d.pingJobs)
+		// НЕ устанавливаем d.pingJobs = nil здесь, чтобы initPingWorkers мог пересоздать
 	}
 	d.pingWorkers.Wait()
+	// после завершения всех воркеров можно сбросить канал
+	d.pingJobs = nil
 }
 
 func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
@@ -649,14 +684,20 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 	}
 	defer socket.Close()
 
-	data := icmpBufPool.Get().([]byte)
-	defer icmpBufPool.Put(data)
+	// Используем фиксированный буфер на стеке (16 байт) для payload
+	var data [16]byte
+	copy(data[:], requestPing.Data)
+
+	reqPing := icmp.Echo{
+		Seq:  requestPing.Seq,
+		Data: data[:],
+	}
 
 	var icmpBytes []byte
 	if addr.Is4() {
-		icmpBytes, _ = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
+		icmpBytes, _ = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &reqPing}).Marshal(nil)
 	} else if addr.Is6() {
-		icmpBytes, _ = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &requestPing}).Marshal(nil)
+		icmpBytes, _ = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &reqPing}).Marshal(nil)
 	} else {
 		Log.Error("Failed to ping: invalid address", "address", addr)
 		return
@@ -667,12 +708,17 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 		Log.Error("Failed to ping: write error", "address", addr, "error", err)
 		return
 	}
-	n, err := socket.Read(data)
+	// Получаем буфер из пула для чтения
+	bufPtr := icmpReadPool.Get().(*[]byte)
+	readBuf := *bufPtr
+	defer icmpReadPool.Put(bufPtr)
+
+	n, err := socket.Read(readBuf)
 	if err != nil {
 		Log.Error("Failed to read ping response", "address", addr, "error", err)
 		return
 	}
-	replyPacket, err := icmp.ParseMessage(1, data[:n])
+	replyPacket, err := icmp.ParseMessage(1, readBuf[:n])
 	if err != nil {
 		Log.Error("Failed to parse ping response", "address", addr, "error", err)
 		return
@@ -683,7 +729,7 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 			Log.Error("Failed to parse ping response: invalid reply type", "address", addr, "type", replyPacket.Type)
 			return
 		}
-		if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
+		if !bytes.Equal(replyPing.Data, reqPing.Data) || replyPing.Seq != reqPing.Seq {
 			Log.Error("Failed to parse ping response: invalid ping reply", "address", addr, "reply", replyPing)
 			return
 		}
@@ -699,11 +745,12 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 		}
 		seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
 		pongBody := replyPing.Data[4:]
-		if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
+		if !bytes.Equal(pongBody, reqPing.Data) || int(seq) != reqPing.Seq {
 			Log.Error("Failed to parse ping response: invalid ping reply", "address", addr, "reply", replyPing)
 			return
 		}
 	}
+	// Успешный пинг – обновляем запись
 	d.PingRecord.Add(addr.String(), uint64(time.Now().Unix()))
 }
 
@@ -711,17 +758,28 @@ func (d *VirtualTun) pingIPs() {
 	if d.pingJobs == nil {
 		d.initPingWorkers()
 	}
+	// Проверяем, что канал не закрыт
+	if d.pingJobs == nil {
+		return
+	}
+	seq := atomic.AddUint32(&pingSeq, 1)
 	for _, addr := range d.Conf.CheckAlive {
-		data := icmpBufPool.Get().([]byte)
-		_, _ = srand.Read(data)
+		// Генерируем payload из seq (без crypto/rand)
+		var data [16]byte
+		binary.BigEndian.PutUint32(data[:4], seq)
+		// можно добавить немного случайности через time
+		binary.BigEndian.PutUint64(data[8:], uint64(time.Now().UnixNano()))
+
 		requestPing := icmp.Echo{
-			Seq:  rand.Intn(1 << 16),
-			Data: data,
+			Seq:  uint16(seq),
+			Data: data[:],
 		}
-		icmpBufPool.Put(data)
 
 		select {
-		case d.pingJobs <- pingJob{addr: addr, requestPing: requestPing}:
+		case d.pingJobs <- pingJob{
+			addr:        addr,
+			requestPing: requestPing,
+		}:
 		case <-d.pingCtx.Done():
 			return
 		}
@@ -742,7 +800,9 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/readyz":
 		now := time.Now()
 		ok := true
-		for _, key := range d.PingRecord.Keys() {
+		// Проверяем каждый адрес из конфига
+		for _, addr := range d.Conf.CheckAlive {
+			key := addr.String()
 			if val, okRec := d.PingRecord.Get(key); okRec {
 				if now.Sub(time.Unix(int64(val), 0)) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
 					ok = false
@@ -767,10 +827,15 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var buf bytes.Buffer
-		for _, peer := range strings.Split(get, "\n") {
-			pair := strings.SplitN(peer, "=", 2)
+		scanner := bufio.NewScanner(strings.NewReader(get))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			pair := strings.SplitN(line, "=", 2)
 			if len(pair) != 2 {
-				buf.WriteString(peer)
+				buf.WriteString(line)
 				continue
 			}
 			if pair[0] == "private_key" || pair[0] == "preshared_key" {
@@ -788,53 +853,74 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---------- Старт/стоп пингов ----------
+// ---------- Старт/стоп пингов (исправленные) ----------
 
 func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
+
+	// Проверяем, не запущен ли уже цикл
+	if d.pingStop != nil {
+		// уже запущен – ничего не делаем
+		return
+	}
 
 	ttl := time.Duration(d.Conf.CheckAliveInterval+2) * time.Second
 	if d.PingRecord == nil {
 		d.PingRecord = expirable.NewLRU[string, uint64](d.DnsCacheSize, nil, ttl)
 	}
 
+	// Инициализируем записи (если не существуют)
 	for _, addr := range d.Conf.CheckAlive {
-		d.PingRecord.Add(addr.String(), 0)
+		if _, ok := d.PingRecord.Get(addr.String()); !ok {
+			d.PingRecord.Add(addr.String(), 0)
+		}
 	}
 
-	if d.pingStop != nil {
-		return
-	}
+	// Создаём канал для остановки
 	d.pingStop = make(chan struct{})
-	d.initPingWorkers()
+	// Запускаем ping-цикл в фоне
+	d.pingLoopWg.Add(1)
+	go d.runPingLoop()
+}
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("StartPingIPs goroutine panicked", "recover", r)
-			}
-		}()
-		d.pingIPs()
-		ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-d.pingStop:
-				d.stopPingWorkers()
-				return
-			case <-ticker.C:
-				d.pingIPs()
-			}
+func (d *VirtualTun) runPingLoop() {
+	defer d.pingLoopWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Error("Ping loop panicked", "recover", r)
 		}
 	}()
+
+	// Инициализируем воркеры
+	d.initPingWorkers()
+	// Сразу запускаем один цикл
+	d.pingIPs()
+
+	ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.pingStop:
+			// Останавливаем воркеры
+			d.stopPingWorkers()
+			return
+		case <-ticker.C:
+			d.pingIPs()
+		}
+	}
 }
 
 func (d *VirtualTun) StopPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
+
 	if d.pingStop != nil {
 		close(d.pingStop)
 		d.pingStop = nil
 	}
+	// Ждём завершения ping-цикла
+	d.pingLoopWg.Wait()
+	// После завершения цикла все воркеры уже остановлены (stopPingWorkers вызван внутри)
 }
