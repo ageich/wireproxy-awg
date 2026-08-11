@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	srand "crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
@@ -167,7 +166,7 @@ type VirtualTun struct {
 
 	pingStop   chan struct{}
 	pingStopMu sync.Mutex
-	pingLoopWg sync.WaitGroup // для ожидания завершения ping-горутины
+	pingLoopWg sync.WaitGroup
 
 	DnsCacheSize        int
 	UdpSessionCacheSize int
@@ -618,21 +617,16 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 
 func (d *VirtualTun) initPingWorkers() {
 	if d.pingJobs != nil {
-		// если канал уже существует, проверяем, не закрыт ли он
-		// если закрыт – пересоздаём
 		select {
 		case _, ok := <-d.pingJobs:
 			if !ok {
-				// канал закрыт – создаём новый
 				d.pingJobs = nil
 			}
 		default:
-			// канал открыт – возвращаемся
 			return
 		}
 	}
 
-	// если канал nil или закрыт, создаём новый
 	d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
@@ -669,10 +663,8 @@ func (d *VirtualTun) stopPingWorkers() {
 	}
 	if d.pingJobs != nil {
 		close(d.pingJobs)
-		// НЕ устанавливаем d.pingJobs = nil здесь, чтобы initPingWorkers мог пересоздать
 	}
 	d.pingWorkers.Wait()
-	// после завершения всех воркеров можно сбросить канал
 	d.pingJobs = nil
 }
 
@@ -684,7 +676,6 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 	}
 	defer socket.Close()
 
-	// Используем фиксированный буфер на стеке (16 байт) для payload
 	var data [16]byte
 	copy(data[:], requestPing.Data)
 
@@ -708,7 +699,6 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 		Log.Error("Failed to ping: write error", "address", addr, "error", err)
 		return
 	}
-	// Получаем буфер из пула для чтения
 	bufPtr := icmpReadPool.Get().(*[]byte)
 	readBuf := *bufPtr
 	defer icmpReadPool.Put(bufPtr)
@@ -750,7 +740,6 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 			return
 		}
 	}
-	// Успешный пинг – обновляем запись
 	d.PingRecord.Add(addr.String(), uint64(time.Now().Unix()))
 }
 
@@ -758,20 +747,17 @@ func (d *VirtualTun) pingIPs() {
 	if d.pingJobs == nil {
 		d.initPingWorkers()
 	}
-	// Проверяем, что канал не закрыт
 	if d.pingJobs == nil {
 		return
 	}
 	seq := atomic.AddUint32(&pingSeq, 1)
 	for _, addr := range d.Conf.CheckAlive {
-		// Генерируем payload из seq (без crypto/rand)
 		var data [16]byte
 		binary.BigEndian.PutUint32(data[:4], seq)
-		// можно добавить немного случайности через time
 		binary.BigEndian.PutUint64(data[8:], uint64(time.Now().UnixNano()))
 
 		requestPing := icmp.Echo{
-			Seq:  uint16(seq),
+			Seq:  int(seq),
 			Data: data[:],
 		}
 
@@ -800,7 +786,6 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/readyz":
 		now := time.Now()
 		ok := true
-		// Проверяем каждый адрес из конфига
 		for _, addr := range d.Conf.CheckAlive {
 			key := addr.String()
 			if val, okRec := d.PingRecord.Get(key); okRec {
@@ -859,9 +844,7 @@ func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
-	// Проверяем, не запущен ли уже цикл
 	if d.pingStop != nil {
-		// уже запущен – ничего не делаем
 		return
 	}
 
@@ -870,16 +853,13 @@ func (d *VirtualTun) StartPingIPs() {
 		d.PingRecord = expirable.NewLRU[string, uint64](d.DnsCacheSize, nil, ttl)
 	}
 
-	// Инициализируем записи (если не существуют)
 	for _, addr := range d.Conf.CheckAlive {
 		if _, ok := d.PingRecord.Get(addr.String()); !ok {
 			d.PingRecord.Add(addr.String(), 0)
 		}
 	}
 
-	// Создаём канал для остановки
 	d.pingStop = make(chan struct{})
-	// Запускаем ping-цикл в фоне
 	d.pingLoopWg.Add(1)
 	go d.runPingLoop()
 }
@@ -892,9 +872,7 @@ func (d *VirtualTun) runPingLoop() {
 		}
 	}()
 
-	// Инициализируем воркеры
 	d.initPingWorkers()
-	// Сразу запускаем один цикл
 	d.pingIPs()
 
 	ticker := time.NewTicker(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
@@ -903,7 +881,6 @@ func (d *VirtualTun) runPingLoop() {
 	for {
 		select {
 		case <-d.pingStop:
-			// Останавливаем воркеры
 			d.stopPingWorkers()
 			return
 		case <-ticker.C:
@@ -920,7 +897,5 @@ func (d *VirtualTun) StopPingIPs() {
 		close(d.pingStop)
 		d.pingStop = nil
 	}
-	// Ждём завершения ping-цикла
 	d.pingLoopWg.Wait()
-	// После завершения цикла все воркеры уже остановлены (stopPingWorkers вызван внутри)
 }
