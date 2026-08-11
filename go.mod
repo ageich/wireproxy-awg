@@ -9,7 +9,7 @@ require (
 	github.com/go-ini/ini v1.67.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/landlock-lsm/go-landlock v0.6.0
-	github.com/ageich/go-socks5@master
+	github.com/things-go/go-socks5 v0.1.1
 	golang.org/x/net v0.47.0
 	suah.dev/protect v1.2.4
 )
@@ -24,4 +24,4 @@ require (
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )
 
-
+replace github.com/things-go/go-socks5 => github.com/ageich/go-socks5 da15a50bca75f541190649ec965308e6f98b894e
