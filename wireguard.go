@@ -11,6 +11,8 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // DeviceSetting contains the parameters for setting up a tun interface
@@ -180,6 +182,25 @@ func StartWireguard(conf *DeviceConfig, logLevel int, pingCacheSize int) (*Virtu
 	if err != nil {
 		return nil, err
 	}
+
+	// Уменьшаем буферы TCP для экономии памяти
+	// Эти значения соответствуют рекомендациям: Min 4KB, Default 8KB, Max 16KB
+	s := tnet.Stack()
+	if err := s.SetOption(tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     4096,
+		Default: 8192,
+		Max:     16384,
+	}); err != nil {
+		Log.Warn("Failed to set TCP receive buffer size", "error", err)
+	}
+	if err := s.SetOption(tcpip.TCPSendBufferSizeRangeOption{
+		Min:     4096,
+		Default: 8192,
+		Max:     16384,
+	}); err != nil {
+		Log.Warn("Failed to set TCP send buffer size", "error", err)
+	}
+
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
 	err = dev.IpcSet(setting.IpcRequest)
 	if err != nil {
