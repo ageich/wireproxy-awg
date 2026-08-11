@@ -285,6 +285,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
+		socks5.WithUDPReadTimeout(IdleTimeout), // <-- добавлена опция для таймаута UDP
 	}
 
 	// Создаём server один раз, а не при каждой итерации
