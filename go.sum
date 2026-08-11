@@ -1,7 +1,7 @@
 github.com/MakeNowJust/heredoc/v2 v2.0.1 h1:rlCHh70XXXv7toz95ajQWOWQnN4WNLt0TdpZYIR/J6A=
 github.com/MakeNowJust/heredoc/v2 v2.0.1/go.mod h1:6/2Abh5s+hc3g9nbWLe9ObDIOhaRrqsyY9MWy+4JdRM=
-github.com/ageich/go-socks5 v0.1.2-0.20260811122751-826332e6715d h1:NU/Bcdq8BjgRdGht/8Kw+1GJV8jSLYDjzg4ER2ypBXI=
-github.com/ageich/go-socks5 v0.1.2-0.20260811122751-826332e6715d/go.mod h1:1YBHVYG7Oli5ae+Pwkp630cPAwY1pjUPmohO1n0Emg0=
+github.com/ageich/go-socks5 v0.1.2-0.20260811141544-da15a50bca75 h1:Grcl4TWeoxckszDTlof2WiCi0ICzOF1YuxWuprzwF7g=
+github.com/ageich/go-socks5 v0.1.2-0.20260811141544-da15a50bca75/go.mod h1:1YBHVYG7Oli5ae+Pwkp630cPAwY1pjUPmohO1n0Emg0=
 github.com/akamensky/argparse v1.4.0 h1:YGzvsTqCvbEZhL8zZu2AiA5nq805NZh75JNj4ajn1xc=
 github.com/akamensky/argparse v1.4.0/go.mod h1:S5kwC7IuDcEr5VeXtGPRVZ5o/FdhcMlQz4IZQuw64xA=
 github.com/amnezia-vpn/amneziawg-go v0.2.19 h1:l3rOmrA4o5z38kpgnA5iSk1yOm7Cv3AafIi4vxpSEV0=

@@ -24,4 +24,4 @@ require (
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )
 
-replace github.com/things-go/go-socks5 => github.com/ageich/go-socks5 da15a50bca75f541190649ec965308e6f98b894e
+replace github.com/things-go/go-socks5 => github.com/ageich/go-socks5 v0.1.2-0.20260811141544-da15a50bca75
