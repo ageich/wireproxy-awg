@@ -479,7 +479,7 @@ func copyBidirectional(a, b net.Conn) {
 	wg.Wait()
 }
 
-// ---------- TCP-туннели с семафором ПЕРЕД Dial (исправлено) ----------
+// ---------- TCP-туннели с семафором ПЕРЕД Dial ----------
 
 func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
@@ -625,7 +625,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	wg.Wait()
 }
 
-// ---------- ICMP ping с worker pool (устранена гонка) ----------
+// ---------- ICMP ping с worker pool (полностью безопасная версия) ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	d.pingMu.Lock()
@@ -651,15 +651,29 @@ func (d *VirtualTun) initPingWorkers() {
 	}
 }
 
+// pingWorker теперь использует локальные копии канала и контекста,
+// полученные под мьютексом при старте, чтобы не зависеть от изменений полей.
 func (d *VirtualTun) pingWorker() {
 	defer d.pingWorkers.Done()
+
+	// Захватываем локальные копии под мьютексом
+	d.pingMu.Lock()
+	jobs := d.pingJobs
+	ctx := d.pingCtx
+	d.pingMu.Unlock()
+
+	if jobs == nil || ctx == nil {
+		return
+	}
+
 	for {
 		select {
-		case <-d.pingCtx.Done():
+		case <-ctx.Done():
 			return
-		case job, ok := <-d.pingJobs:
+		case job, ok := <-jobs:
 			if !ok {
-				return // канал закрыт, но мы больше не закрываем его, оставлено на случай
+				// канал закрыт – но мы его не закрываем, оставлено на случай
+				return
 			}
 			d.doPing(job.addr, job.requestPing)
 		}
@@ -667,32 +681,27 @@ func (d *VirtualTun) pingWorker() {
 }
 
 func (d *VirtualTun) stopPingWorkers() {
-	// Копируем необходимые значения под мьютексом, затем отпускаем его перед Wait
+	// Захватываем мьютекс, обнуляем поля и копируем cancel-функцию
 	d.pingMu.Lock()
-	started := d.pingWorkersStarted
-	var cancel context.CancelFunc
-	if started {
-		cancel = d.pingCancel
-		d.pingCancel = nil
-		d.pingWorkersStarted = false
-		// Канал не закрываем – только отменяем контекст
-	}
-	d.pingMu.Unlock()
-
-	if !started {
+	if !d.pingWorkersStarted {
+		d.pingMu.Unlock()
 		return
 	}
+	cancel := d.pingCancel
+	// Немедленно обнуляем все поля, чтобы новые вызовы не увидели старый канал
+	d.pingCancel = nil
+	d.pingCtx = nil
+	d.pingJobs = nil
+	d.pingWorkersStarted = false
+	d.pingMu.Unlock()
+
+	// Отменяем контекст – воркеры выйдут по Done()
 	if cancel != nil {
 		cancel()
 	}
-	// Ждём завершения всех воркеров – блокировка уже отпущена
-	d.pingWorkers.Wait()
 
-	// После Wait можно обнулить канал (опционально)
-	d.pingMu.Lock()
-	d.pingJobs = nil
-	d.pingCtx = nil
-	d.pingMu.Unlock()
+	// Ждём завершения всех воркеров (мьютекс уже отпущен)
+	d.pingWorkers.Wait()
 }
 
 func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
