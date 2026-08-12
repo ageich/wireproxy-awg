@@ -20,10 +20,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/device"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/ageich/go-socks5"
 	"github.com/ageich/go-socks5/bufferpool"
+	"github.com/amnezia-vpn/amneziawg-go/device"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -80,10 +80,10 @@ type closeReader interface {
 
 type timeoutConn struct {
 	net.Conn
-	idle           time.Duration
-	readDeadline   time.Time
-	writeDeadline  time.Time
-	mu             sync.Mutex
+	idle          time.Duration
+	readDeadline  time.Time
+	writeDeadline time.Time
+	mu            sync.Mutex
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
@@ -201,14 +201,14 @@ type addressPort struct {
 
 // ---------- Вспомогательные функции ----------
 
-func (d VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
+func (d *VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
 	if d.SystemDNS {
 		return net.DefaultResolver.LookupHost(ctx, name)
 	}
 	return d.Tnet.LookupContextHost(ctx, name)
 }
 
-func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*netip.Addr, error) {
+func (d *VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*netip.Addr, error) {
 	addrs, err := d.LookupAddr(ctx, name)
 	if err != nil {
 		return nil, err
@@ -236,7 +236,7 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	return &addr, nil
 }
 
-func (d VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+func (d *VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	addr, err := d.ResolveAddrWithContext(ctx, name)
 	if err != nil {
 		return nil, nil, err
@@ -256,7 +256,7 @@ func parseAddressPort(endpoint string) (*addressPort, error) {
 	return &addressPort{address: name, port: uint16(port)}, nil
 }
 
-func (d VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort) (*netip.AddrPort, error) {
+func (d *VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort) (*netip.AddrPort, error) {
 	addr, err := d.ResolveAddrWithContext(ctx, endpoint.address)
 	if err != nil {
 		return nil, err
@@ -289,6 +289,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
+		socks5.WithUDPReadTimeout(IdleTimeout),
 	}
 
 	server := socks5.NewServer(options...)
@@ -832,7 +833,7 @@ func (d *VirtualTun) pingIPs() {
 
 // ---------- Health check и метрики (без лишнего логирования, с защитой от nil) ----------
 
-func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (d *VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if r := recover(); r != nil {
 			Log.Error("ServeHTTP panicked", "recover", r)

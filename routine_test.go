@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 func TestFixedResolver_LRUCacheSize(t *testing.T) {
@@ -13,18 +13,18 @@ func TestFixedResolver_LRUCacheSize(t *testing.T) {
 	resolver := NewFixedResolver(nil, false, time.Hour, 2)
 
 	// Добавляем 3 записи напрямую в кэш (третья вытеснит первую)
-	resolver.Cache.Add("a.com", net.IP{192, 0, 2, 1})
-	resolver.Cache.Add("b.com", net.IP{192, 0, 2, 2})
-	resolver.Cache.Add("c.com", net.IP{192, 0, 2, 3})
+	resolver.cache.Add("a.com", net.IP{192, 0, 2, 1})
+	resolver.cache.Add("b.com", net.IP{192, 0, 2, 2})
+	resolver.cache.Add("c.com", net.IP{192, 0, 2, 3})
 
 	// Проверяем, что a.com вытеснена
-	if _, ok := resolver.Cache.Get("a.com"); ok {
+	if _, ok := resolver.cache.Get("a.com"); ok {
 		t.Error("expected a.com to be evicted")
 	}
-	if _, ok := resolver.Cache.Get("b.com"); !ok {
+	if _, ok := resolver.cache.Get("b.com"); !ok {
 		t.Error("expected b.com to be present")
 	}
-	if _, ok := resolver.Cache.Get("c.com"); !ok {
+	if _, ok := resolver.cache.Get("c.com"); !ok {
 		t.Error("expected c.com to be present")
 	}
 }
@@ -34,10 +34,10 @@ func TestFixedResolver_TTLExpiration(t *testing.T) {
 	resolver := NewFixedResolver(nil, false, 100*time.Millisecond, 10)
 
 	// Добавляем запись
-	resolver.Cache.Add("test.com", net.IP{192, 0, 2, 1})
+	resolver.cache.Add("test.com", net.IP{192, 0, 2, 1})
 
 	// Сразу должна быть доступна
-	if _, ok := resolver.Cache.Get("test.com"); !ok {
+	if _, ok := resolver.cache.Get("test.com"); !ok {
 		t.Error("expected test.com to be present")
 	}
 
@@ -45,17 +45,14 @@ func TestFixedResolver_TTLExpiration(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Должна быть удалена
-	if _, ok := resolver.Cache.Get("test.com"); ok {
+	if _, ok := resolver.cache.Get("test.com"); ok {
 		t.Error("expected test.com to be expired and removed")
 	}
 }
 
 func TestPingRecord_LRUCacheSize(t *testing.T) {
 	// Создаём LRU-кэш размером 2
-	cache, err := lru.New[string, uint64](2)
-	if err != nil {
-		t.Fatalf("failed to create cache: %v", err)
-	}
+	cache := expirable.NewLRU[string, uint64](2, nil, time.Hour)
 
 	// Добавляем 3 записи
 	cache.Add("ip1", 100)
@@ -76,7 +73,7 @@ func TestPingRecord_LRUCacheSize(t *testing.T) {
 
 // Проверяем, что PingRecord корректно инициализируется в VirtualTun
 func TestVirtualTun_PingRecordInit(t *testing.T) {
-	cache, _ := lru.New[string, uint64](5)
+	cache := expirable.NewLRU[string, uint64](5, nil, time.Hour)
 	vt := &VirtualTun{
 		PingRecord: cache,
 	}

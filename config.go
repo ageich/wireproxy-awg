@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -530,6 +531,10 @@ func ParseConfig(path string) (*Configuration, error) {
 		return nil, err
 	}
 
+	if err := validateDeviceConfig(device); err != nil {
+		return nil, fmt.Errorf("invalid device config: %w", err)
+	}
+
 	var routinesSpawners []RoutineSpawner
 
 	err = parseRoutinesConfig(&routinesSpawners, cfg, "TCPClientTunnel", parseTCPClientTunnelConfig)
@@ -566,9 +571,9 @@ func ParseConfig(path string) (*Configuration, error) {
 	}
 
 	config := &Configuration{
-		Device:   device,
-		Routines: routinesSpawners,
-		Resolve:  resolve,
+		Device:              device,
+		Routines:            routinesSpawners,
+		Resolve:             resolve,
 		DnsCacheSize:        1000,
 		PingCacheSize:       500,
 		UdpSessionCacheSize: 500,

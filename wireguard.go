@@ -53,9 +53,6 @@ func validateDeviceConfig(conf *DeviceConfig) error {
 // Оптимизировано: предварительное выделение буфера для уменьшения перераспределений.
 func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	// Валидация перед построением IPC
-	if err := validateDeviceConfig(conf); err != nil {
-		return nil, fmt.Errorf("invalid device config: %w", err)
-	}
 
 	var request bytes.Buffer
 	request.Grow(4096)

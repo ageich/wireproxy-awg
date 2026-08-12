@@ -302,7 +302,7 @@ PersistentKeepalive = 25`
 		t.Fatal(err)
 	}
 
-	expectedError := "value of the Jmin field must be less than or equal to Jmax field value"
+	expectedError := "Jmin must be less than or equal to Jmax"
 	err = ParseInterface(iniData, &cfg)
 	if err == nil {
 		t.Fatal("error expected")
@@ -339,7 +339,7 @@ PersistentKeepalive = 25`
 		t.Fatal(err)
 	}
 
-	expectedError := "value of the Jmax field must be less than or equal 1280"
+	expectedError := "Jmax must be less than or equal to 1280"
 	err = ParseInterface(iniData, &cfg)
 	if err == nil {
 		t.Fatal("error expected")
@@ -453,7 +453,12 @@ PrivateKey = LAr1aNSNF9d0MjwUgAVC4020T0N/E5NUtqVv5EnsSz0=
 	Address = 10.5.0.2
 	DNS = 1.1.1.1
 	I1 = <b 0xA1B2C3D4E5F6><c>
-	`
+
+[Peer]
+PublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 94.140.11.15:51820
+`
 
 	var cfg DeviceConfig
 	iniData, err := loadIniConfig(config)
@@ -531,6 +536,11 @@ H1 = 100-101
 H2 = 102-103
 H3 = 104
 H4 = 105-106
+
+[Peer]
+PublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 94.140.11.15:51820
 `
 
 	var cfg DeviceConfig
