@@ -287,7 +287,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
-		socks5.WithUDPReadTimeout(IdleTimeout),
+		// Удалена несуществующая опция socks5.WithUDPReadTimeout
 	}
 
 	server := socks5.NewServer(options...)
