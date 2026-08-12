@@ -14,8 +14,6 @@ require (
 	suah.dev/protect v1.2.4
 )
 
-replace github.com/things-go/go-socks5 => github.com/ageich/go-socks5 v0.0.0-20260811145315-d43c18fab98a
-
 require (
 	github.com/google/btree v1.1.3 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
