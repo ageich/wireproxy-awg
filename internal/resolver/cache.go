@@ -6,7 +6,7 @@ import (
     "sync"
     "time"
 
-    "github.com/things-go/go-socks5"
+    "github.com/ageich/go-socks5"
 )
 
 // CachedResolver implements socks5.Resolver with automatic cache cleanup.
