@@ -43,7 +43,6 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
-// Рассчитываем на основе количества CPU для лучшей масштабируемости
 var tcpSemaphore = make(chan struct{}, runtime.GOMAXPROCS(0)*256)
 
 // ---------- DNS перемешивание ----------
@@ -57,7 +56,7 @@ var (
 
 var icmpReadPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 128)
+		b := make([]byte, 1500) // увеличен до MTU
 		return &b
 	},
 }
@@ -76,24 +75,34 @@ type closeReader interface {
 	CloseRead() error
 }
 
-// ---------- timeoutConn с упрощённым управлением дедлайнами ----------
+// ---------- timeoutConn с восстановленной умной логикой ----------
 
 type timeoutConn struct {
 	net.Conn
-	idle time.Duration
+	idle           time.Duration
+	readDeadline   time.Time
+	writeDeadline  time.Time
+	mu             sync.Mutex
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	if c.idle > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	c.mu.Lock()
+	// Обновляем дедлайн только если он не установлен или уже близок к истечению
+	if c.readDeadline.IsZero() || time.Now().After(c.readDeadline.Add(-c.idle/10)) {
+		c.readDeadline = time.Now().Add(c.idle)
+		_ = c.Conn.SetReadDeadline(c.readDeadline)
 	}
+	c.mu.Unlock()
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	if c.idle > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	c.mu.Lock()
+	if c.writeDeadline.IsZero() || time.Now().After(c.writeDeadline.Add(-c.idle/10)) {
+		c.writeDeadline = time.Now().Add(c.idle)
+		_ = c.Conn.SetWriteDeadline(c.writeDeadline)
 	}
+	c.mu.Unlock()
 	return c.Conn.Write(p)
 }
 
@@ -206,7 +215,6 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	if size == 0 {
 		return nil, errors.New("no address found for: " + name)
 	}
-	// Используем глобальный PRNG с мьютексом вместо создания нового на каждый вызов
 	dnsRandMu.Lock()
 	dnsRand.Shuffle(size, func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
@@ -303,7 +311,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			idle:     IdleTimeout,
 		}
 
-		// Гор routine для закрытия listener при отмене контекста
 		go func() {
 			<-ctx.Done()
 			rawListener.Close()
@@ -313,14 +320,12 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		err = server.Serve(listener)
 
 		if ctx.Err() != nil {
-			// Контекст отменён – listener уже закрыт, выходим
 			return nil
 		}
 
-		// Ошибка не от контекста – перезапускаем
 		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
 		rawListener.Close()
-		time.Sleep(100 * time.Millisecond)
+		// Увеличенная пауза перед перезапуском для стабильности
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -481,7 +486,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	// Сначала разрешаем и устанавливаем соединение
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("TCP Client Tunnel resolve error", "address", raddr.address, "error", err)
@@ -496,7 +500,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	// Захватываем семафор только перед копированием
 	select {
 	case tcpSemaphore <- struct{}{}:
 		defer func() { <-tcpSemaphore }()
@@ -504,11 +507,7 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 		return
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
-
+	// Таймауты устанавливать не нужно – они уже управляются timeoutConn
 	copyBidirectional(conn, sconn)
 }
 
@@ -540,11 +539,6 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	case <-ctx.Done():
 		return
 	}
-
-	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
 	copyBidirectional(conn, sconn)
 }
@@ -583,11 +577,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 		return
 	}
 
-	_ = stdout.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = stdout.SetWriteDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
-	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -596,7 +585,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	go func() {
 		defer wg.Done()
 		_, _ = CopyWithPool(sconn, os.Stdin)
-		// При завершении копирования закрываем сторону записи sconn
 		if cw, ok := sconn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		} else {
@@ -611,7 +599,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	go func() {
 		defer wg.Done()
 		_, _ = CopyWithPool(stdout, sconn)
-		// При завершении копирования закрываем сторону чтения sconn
 		if cr, ok := sconn.(closeReader); ok {
 			_ = cr.CloseRead()
 		} else {
@@ -623,13 +610,11 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 		}
 	}()
 
-	// Ждём либо отмены контекста, либо завершения одной из копий
 	select {
 	case <-ctx.Done():
 		_ = sconn.Close()
 		_ = stdout.Close()
 	case <-done:
-		// Одна сторона завершилась – закрываем sconn, чтобы вышла вторая
 		_ = sconn.Close()
 		_ = stdout.Close()
 	}
@@ -637,7 +622,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	wg.Wait()
 }
 
-// ---------- ICMP ping с worker pool (исправленный) ----------
+// ---------- ICMP ping с worker pool ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	d.pingMu.Lock()
@@ -740,9 +725,9 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 
 	var proto int
 	if addr.Is4() {
-		proto = 1 // ICMPv4
+		proto = 1
 	} else if addr.Is6() {
-		proto = 58 // ICMPv6
+		proto = 58
 	} else {
 		Log.Error("Failed to parse ping response: invalid address type", "address", addr)
 		return
