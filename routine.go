@@ -76,33 +76,24 @@ type closeReader interface {
 	CloseRead() error
 }
 
-// ---------- timeoutConn с кэшированием дедлайна ----------
+// ---------- timeoutConn с упрощённым управлением дедлайнами ----------
 
 type timeoutConn struct {
 	net.Conn
-	idle           time.Duration
-	readDeadline   time.Time
-	writeDeadline  time.Time
-	mu             sync.Mutex
+	idle time.Duration
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.readDeadline.IsZero() || time.Now().After(c.readDeadline.Add(-c.idle/10)) {
-		c.readDeadline = time.Now().Add(c.idle)
-		_ = c.Conn.SetReadDeadline(c.readDeadline)
+	if c.idle > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
 	}
-	c.mu.Unlock()
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.writeDeadline.IsZero() || time.Now().After(c.writeDeadline.Add(-c.idle/10)) {
-		c.writeDeadline = time.Now().Add(c.idle)
-		_ = c.Conn.SetWriteDeadline(c.writeDeadline)
+	if c.idle > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
 	}
-	c.mu.Unlock()
 	return c.Conn.Write(p)
 }
 
@@ -176,6 +167,8 @@ type VirtualTun struct {
 	pingWorkers sync.WaitGroup
 	pingCtx     context.Context
 	pingCancel  context.CancelFunc
+	// Флаг, что workers запущены
+	pingWorkersStarted bool
 }
 
 type pingJob struct {
@@ -285,7 +278,7 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
-		socks5.WithUDPReadTimeout(IdleTimeout), // <-- добавлена опция для таймаута UDP
+		socks5.WithUDPReadTimeout(IdleTimeout),
 	}
 
 	// Создаём server один раз, а не при каждой итерации
@@ -310,22 +303,25 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			idle:     IdleTimeout,
 		}
 
-		closeChan := make(chan struct{})
+		// Запускаем горутину для закрытия listener при отмене контекста
 		go func() {
 			<-ctx.Done()
 			rawListener.Close()
-			close(closeChan)
 		}()
 
 		Log.Info("SOCKS5 server started", "bind", config.BindAddress)
 		err = server.Serve(listener)
+
 		if ctx.Err() != nil {
-			<-closeChan
+			// Контекст отменён, listener уже закрыт, выходим
 			return nil
 		}
+
+		// Если ошибка не от контекста, перезапускаем
 		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
 		rawListener.Close()
-		<-closeChan
+		// Даём время на закрытие
+		time.Sleep(100 * time.Millisecond)
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -428,7 +424,6 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 }
 
 // ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
-// Универсальный half-close через интерфейсы
 
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
@@ -481,7 +476,7 @@ func copyBidirectional(a, b net.Conn) {
 	wg.Wait()
 }
 
-// ---------- TCP-туннели с семафором ----------
+// ---------- TCP-туннели с семафором (после resolve + dial) ----------
 
 func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
@@ -491,25 +486,29 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-
+	// Сначала разрешаем адрес и устанавливаем соединение
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("TCP Client Tunnel resolve error", "address", raddr.address, "error", err)
 		return
 	}
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
+
+	// Используем dial через туннель (унифицируем)
+	sconn, err := dialWithTimeout(ctx, "tcp", tcpAddr.String(), vt)
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "error", err)
 		return
 	}
 	defer sconn.Close()
+
+	// Теперь захватываем семафор перед копированием
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
@@ -527,25 +526,26 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}()
 	defer conn.Close()
 
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("TCP Server Tunnel resolve error", "address", raddr.address, "error", err)
 		return
 	}
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
+
+	sconn, err := dialWithTimeout(ctx, "tcp", tcpAddr.String(), vt)
 	if err != nil {
 		Log.Error("TCP Server Tunnel dial error", "target", target, "error", err)
 		return
 	}
 	defer sconn.Close()
+
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = conn.SetWriteDeadline(time.Now().Add(IdleTimeout))
@@ -562,13 +562,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 		}
 	}()
 
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
 		Log.Error("Name resolution error", "address", raddr.address, "error", err)
@@ -582,63 +575,95 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	defer stdout.Close()
 
 	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := defaultDialer.DialContext(ctx, "tcp", tcpAddr.String())
+	sconn, err := dialWithTimeout(ctx, "tcp", tcpAddr.String(), vt)
 	if err != nil {
 		Log.Error("TCP Client Tunnel dial error", "target", target, "tcpAddr", tcpAddr, "error", err)
 		return
 	}
 	defer sconn.Close()
 
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
+
 	_ = stdout.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = stdout.SetWriteDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetReadDeadline(time.Now().Add(IdleTimeout))
 	_ = sconn.SetWriteDeadline(time.Now().Add(IdleTimeout))
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	done := make(chan struct{}, 1)
+
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("STDIOTcpForward copy goroutine 1 panicked", "recover", r)
-			}
-		}()
+		defer wg.Done()
 		_, _ = CopyWithPool(sconn, os.Stdin)
-	}()
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error("STDIOTcpForward copy goroutine 2 panicked", "recover", r)
-			}
-		}()
-		_, _ = CopyWithPool(stdout, sconn)
+		// при завершении копирования закрываем sconn для записи
+		if cw, ok := sconn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = sconn.Close()
+		}
+		select {
+		case done <- struct{}{}:
+		default:
+		}
 	}()
 
-	<-ctx.Done()
+	go func() {
+		defer wg.Done()
+		_, _ = CopyWithPool(stdout, sconn)
+		// при завершении копирования закрываем stdout (хотя это не обязательно)
+		// и sconn для чтения
+		if cr, ok := sconn.(closeReader); ok {
+			_ = cr.CloseRead()
+		} else {
+			_ = sconn.Close()
+		}
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}()
+
+	// Ждём либо ctx.Done(), либо завершения одной из копий
+	select {
+	case <-ctx.Done():
+		_ = sconn.Close()
+		_ = stdout.Close()
+	case <-done:
+		// Одна сторона завершилась, вторая тоже выйдет после Close()
+		_ = sconn.Close()
+		_ = stdout.Close()
+	}
+
+	wg.Wait()
 }
 
 // ---------- ICMP ping с worker pool (исправленный) ----------
 
 func (d *VirtualTun) initPingWorkers() {
-	if d.pingJobs != nil {
-		select {
-		case _, ok := <-d.pingJobs:
-			if !ok {
-				d.pingJobs = nil
-			}
-		default:
-			return
+	if d.pingWorkersStarted {
+		return
+	}
+	if d.pingJobs == nil {
+		d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
+		workers := runtime.GOMAXPROCS(0)
+		if workers < 2 {
+			workers = 2
 		}
-	}
+		queueSize := workers * 16
+		d.pingJobs = make(chan pingJob, queueSize)
 
-	d.pingCtx, d.pingCancel = context.WithCancel(context.Background())
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 2 {
-		workers = 2
-	}
-	queueSize := workers * 16
-	d.pingJobs = make(chan pingJob, queueSize)
-
-	for i := 0; i < workers; i++ {
-		d.pingWorkers.Add(1)
-		go d.pingWorker()
+		for i := 0; i < workers; i++ {
+			d.pingWorkers.Add(1)
+			go d.pingWorker()
+		}
+		d.pingWorkersStarted = true
 	}
 }
 
@@ -658,15 +683,19 @@ func (d *VirtualTun) pingWorker() {
 }
 
 func (d *VirtualTun) stopPingWorkers() {
+	if !d.pingWorkersStarted {
+		return
+	}
 	if d.pingCancel != nil {
 		d.pingCancel()
 		d.pingCancel = nil
 	}
 	if d.pingJobs != nil {
 		close(d.pingJobs)
+		d.pingJobs = nil
 	}
 	d.pingWorkers.Wait()
-	d.pingJobs = nil
+	d.pingWorkersStarted = false
 }
 
 func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
@@ -709,11 +738,25 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 		Log.Error("Failed to read ping response", "address", addr, "error", err)
 		return
 	}
-	replyPacket, err := icmp.ParseMessage(1, readBuf[:n])
+
+	// Определяем протокол для разбора ответа
+	var proto int
+	if addr.Is4() {
+		proto = 1 // ICMPv4
+	} else if addr.Is6() {
+		proto = 58 // ICMPv6
+	} else {
+		Log.Error("Failed to parse ping response: invalid address type", "address", addr)
+		return
+	}
+
+	replyPacket, err := icmp.ParseMessage(proto, readBuf[:n])
 	if err != nil {
 		Log.Error("Failed to parse ping response", "address", addr, "error", err)
 		return
 	}
+
+	// Обрабатываем ответ в зависимости от протокола
 	if addr.Is4() {
 		replyPing, ok := replyPacket.Body.(*icmp.Echo)
 		if !ok {
@@ -745,7 +788,7 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 }
 
 func (d *VirtualTun) pingIPs() {
-	if d.pingJobs == nil {
+	if !d.pingWorkersStarted {
 		d.initPingWorkers()
 	}
 	if d.pingJobs == nil {
@@ -782,7 +825,12 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}()
-	Log.Info("Health metric request", "path", r.URL.Path)
+	// Снижаем уровень лога для health-запросов
+	if r.URL.Path == "/metrics" || r.URL.Path == "/readyz" {
+		Log.Debug("Health metric request", "path", r.URL.Path)
+	} else {
+		Log.Info("HTTP request", "path", r.URL.Path)
+	}
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
 		now := time.Now()
@@ -870,6 +918,8 @@ func (d *VirtualTun) runPingLoop() {
 	defer func() {
 		if r := recover(); r != nil {
 			Log.Error("Ping loop panicked", "recover", r)
+			// При панике останавливаем workers, чтобы не было утечки
+			d.stopPingWorkers()
 		}
 	}()
 
