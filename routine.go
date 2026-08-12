@@ -56,7 +56,7 @@ var (
 
 var icmpReadPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 1500) // увеличен до MTU
+		b := make([]byte, 1500)
 		return &b
 	},
 }
@@ -75,7 +75,7 @@ type closeReader interface {
 	CloseRead() error
 }
 
-// ---------- timeoutConn с восстановленной умной логикой ----------
+// ---------- timeoutConn с оптимизированной установкой дедлайна ----------
 
 type timeoutConn struct {
 	net.Conn
@@ -87,9 +87,9 @@ type timeoutConn struct {
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
-	// Обновляем дедлайн только если он не установлен или уже близок к истечению
-	if c.readDeadline.IsZero() || time.Now().After(c.readDeadline.Add(-c.idle/10)) {
-		c.readDeadline = time.Now().Add(c.idle)
+	now := time.Now()
+	if c.readDeadline.IsZero() || now.After(c.readDeadline.Add(-c.idle/10)) {
+		c.readDeadline = now.Add(c.idle)
 		_ = c.Conn.SetReadDeadline(c.readDeadline)
 	}
 	c.mu.Unlock()
@@ -98,8 +98,9 @@ func (c *timeoutConn) Read(p []byte) (int, error) {
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	if c.writeDeadline.IsZero() || time.Now().After(c.writeDeadline.Add(-c.idle/10)) {
-		c.writeDeadline = time.Now().Add(c.idle)
+	now := time.Now()
+	if c.writeDeadline.IsZero() || now.After(c.writeDeadline.Add(-c.idle/10)) {
+		c.writeDeadline = now.Add(c.idle)
 		_ = c.Conn.SetWriteDeadline(c.writeDeadline)
 	}
 	c.mu.Unlock()
@@ -287,7 +288,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
-		// Удалена несуществующая опция socks5.WithUDPReadTimeout
 	}
 
 	server := socks5.NewServer(options...)
@@ -325,7 +325,6 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 
 		Log.Warn("SOCKS5 server stopped unexpectedly, restarting", "error", err)
 		rawListener.Close()
-		// Увеличенная пауза перед перезапуском для стабильности
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -429,6 +428,9 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualT
 
 // ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
 
+// copyBidirectional копирует данные в обе стороны.
+// Если соединение поддерживает half-close, используется CloseWrite/CloseRead,
+// иначе вызывается Close() (что может закрыть второе направление – допустимо).
 func copyBidirectional(a, b net.Conn) {
 	var wg sync.WaitGroup
 	var closeA, closeB sync.Once
@@ -476,7 +478,7 @@ func copyBidirectional(a, b net.Conn) {
 	wg.Wait()
 }
 
-// ---------- TCP-туннели с семафором после Dial ----------
+// ---------- TCP-туннели с семафором ПЕРЕД Dial (исправлено) ----------
 
 func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	defer func() {
@@ -485,6 +487,14 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 		}
 	}()
 	defer conn.Close()
+
+	// Захватываем семафор до разрешения DNS и Dial
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
 
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
@@ -500,14 +510,6 @@ func tcpClientForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-
-	// Таймауты устанавливать не нужно – они уже управляются timeoutConn
 	copyBidirectional(conn, sconn)
 }
 
@@ -518,6 +520,13 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 		}
 	}()
 	defer conn.Close()
+
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
 
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
@@ -533,13 +542,6 @@ func tcpServerForward(ctx context.Context, vt *VirtualTun, raddr *addressPort, c
 	}
 	defer sconn.Close()
 
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-
 	copyBidirectional(conn, sconn)
 }
 
@@ -549,6 +551,13 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 			Log.Error("STDIOTcpForward panicked", "recover", r)
 		}
 	}()
+
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() { <-tcpSemaphore }()
+	case <-ctx.Done():
+		return
+	}
 
 	target, err := vt.resolveToAddrPort(ctx, raddr)
 	if err != nil {
@@ -569,13 +578,6 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 		return
 	}
 	defer sconn.Close()
-
-	select {
-	case tcpSemaphore <- struct{}{}:
-		defer func() { <-tcpSemaphore }()
-	case <-ctx.Done():
-		return
-	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -622,7 +624,7 @@ func STDIOTcpForward(ctx context.Context, vt *VirtualTun, raddr *addressPort) {
 	wg.Wait()
 }
 
-// ---------- ICMP ping с worker pool ----------
+// ---------- ICMP ping с worker pool (устранена гонка) ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	d.pingMu.Lock()
@@ -656,7 +658,7 @@ func (d *VirtualTun) pingWorker() {
 			return
 		case job, ok := <-d.pingJobs:
 			if !ok {
-				return
+				return // канал закрыт, но мы больше не закрываем его, оставлено на случай
 			}
 			d.doPing(job.addr, job.requestPing)
 		}
@@ -670,16 +672,20 @@ func (d *VirtualTun) stopPingWorkers() {
 	if !d.pingWorkersStarted {
 		return
 	}
+	// Отменяем контекст, воркеры выйдут по Done()
 	if d.pingCancel != nil {
 		d.pingCancel()
 		d.pingCancel = nil
 	}
-	if d.pingJobs != nil {
-		close(d.pingJobs)
-		d.pingJobs = nil
-	}
+	// НЕ закрываем канал, чтобы избежать гонки с pingIPs()
+	// Канал останется открытым, но на него больше не будут отправлять,
+	// потому что pingIPs() проверяет контекст и выходит.
+	// При следующем запуске initPingWorkers() создаст новый канал.
 	d.pingWorkers.Wait()
 	d.pingWorkersStarted = false
+	// Обнуляем канал и контекст, чтобы при следующем запуске создать новые
+	d.pingJobs = nil
+	d.pingCtx = nil
 }
 
 func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
@@ -770,6 +776,7 @@ func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
 }
 
 func (d *VirtualTun) pingIPs() {
+	// Копируем канал и контекст под мьютексом
 	d.pingMu.Lock()
 	pingJobs := d.pingJobs
 	pingCtx := d.pingCtx
@@ -778,6 +785,13 @@ func (d *VirtualTun) pingIPs() {
 	if pingJobs == nil || pingCtx == nil {
 		return
 	}
+	// Проверяем, не отменён ли контекст перед отправкой
+	select {
+	case <-pingCtx.Done():
+		return
+	default:
+	}
+
 	seq := atomic.AddUint32(&pingSeq, 1)
 	for _, addr := range d.Conf.CheckAlive {
 		var data [16]byte
@@ -800,7 +814,7 @@ func (d *VirtualTun) pingIPs() {
 	}
 }
 
-// ---------- Health check и метрики ----------
+// ---------- Health check и метрики (без лишнего логирования) ----------
 
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
@@ -809,12 +823,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}()
-	// Снижаем уровень лога для health-запросов
-	if r.URL.Path == "/metrics" || r.URL.Path == "/readyz" {
-		Log.Debug("Health metric request", "path", r.URL.Path)
-	} else {
-		Log.Info("HTTP request", "path", r.URL.Path)
-	}
+	// Не логируем стандартные health-запросы для снижения шума
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
 		now := time.Now()
@@ -867,11 +876,12 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(buf.Bytes())
 	default:
+		Log.Info("HTTP request", "path", r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
 	}
 }
 
-// ---------- Старт/стоп пингов ----------
+// ---------- Старт/стоп пингов (исправлен размер LRU) ----------
 
 func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
@@ -882,8 +892,14 @@ func (d *VirtualTun) StartPingIPs() {
 	}
 
 	ttl := time.Duration(d.Conf.CheckAliveInterval+2) * time.Second
+
+	// Размер кэша должен быть не меньше количества адресов для пинга
+	cacheSize := d.DnsCacheSize
+	if len(d.Conf.CheckAlive) > cacheSize {
+		cacheSize = len(d.Conf.CheckAlive)
+	}
 	if d.PingRecord == nil {
-		d.PingRecord = expirable.NewLRU[string, uint64](d.DnsCacheSize, nil, ttl)
+		d.PingRecord = expirable.NewLRU[string, uint64](cacheSize, nil, ttl)
 	}
 
 	for _, addr := range d.Conf.CheckAlive {
