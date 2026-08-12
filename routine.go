@@ -22,8 +22,8 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/hashicorp/golang-lru/v2/expirable"
-	"github.com/things-go/go-socks5"
-	"github.com/things-go/go-socks5/bufferpool"
+	"github.com/ageich/go-socks5"
+	"github.com/ageich/go-socks5/bufferpool"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
