@@ -43,6 +43,7 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Семафор для ограничения количества одновременно устанавливаемых TCP-соединений
+// Используется для защиты от одновременных Dial, поэтому захватывается до вызова dialWithTimeout
 var tcpSemaphore = make(chan struct{}, runtime.GOMAXPROCS(0)*256)
 
 // ---------- DNS перемешивание ----------
@@ -666,26 +667,32 @@ func (d *VirtualTun) pingWorker() {
 }
 
 func (d *VirtualTun) stopPingWorkers() {
+	// Копируем необходимые значения под мьютексом, затем отпускаем его перед Wait
 	d.pingMu.Lock()
-	defer d.pingMu.Unlock()
+	started := d.pingWorkersStarted
+	var cancel context.CancelFunc
+	if started {
+		cancel = d.pingCancel
+		d.pingCancel = nil
+		d.pingWorkersStarted = false
+		// Канал не закрываем – только отменяем контекст
+	}
+	d.pingMu.Unlock()
 
-	if !d.pingWorkersStarted {
+	if !started {
 		return
 	}
-	// Отменяем контекст, воркеры выйдут по Done()
-	if d.pingCancel != nil {
-		d.pingCancel()
-		d.pingCancel = nil
+	if cancel != nil {
+		cancel()
 	}
-	// НЕ закрываем канал, чтобы избежать гонки с pingIPs()
-	// Канал останется открытым, но на него больше не будут отправлять,
-	// потому что pingIPs() проверяет контекст и выходит.
-	// При следующем запуске initPingWorkers() создаст новый канал.
+	// Ждём завершения всех воркеров – блокировка уже отпущена
 	d.pingWorkers.Wait()
-	d.pingWorkersStarted = false
-	// Обнуляем канал и контекст, чтобы при следующем запуске создать новые
+
+	// После Wait можно обнулить канал (опционально)
+	d.pingMu.Lock()
 	d.pingJobs = nil
 	d.pingCtx = nil
+	d.pingMu.Unlock()
 }
 
 func (d *VirtualTun) doPing(addr netip.Addr, requestPing icmp.Echo) {
@@ -814,7 +821,7 @@ func (d *VirtualTun) pingIPs() {
 	}
 }
 
-// ---------- Health check и метрики (без лишнего логирования) ----------
+// ---------- Health check и метрики (без лишнего логирования, с защитой от nil) ----------
 
 func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
@@ -826,6 +833,10 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Не логируем стандартные health-запросы для снижения шума
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
+		if d.PingRecord == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		now := time.Now()
 		ok := true
 		for _, addr := range d.Conf.CheckAlive {
@@ -881,7 +892,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---------- Старт/стоп пингов (исправлен размер LRU) ----------
+// ---------- Старт/стоп пингов (исправлен размер LRU, защита от nil) ----------
 
 func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
