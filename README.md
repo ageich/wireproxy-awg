@@ -1,5 +1,3 @@
----
-
 ```markdown
 [![ISC licensed](https://img.shields.io/badge/license-ISC-blue)](./LICENSE)
 [![Build status](https://github.com/ageich/wireproxy-awg/actions/workflows/build.yml/badge.svg)](https://github.com/ageich/wireproxy-awg/actions)
@@ -147,5 +145,3 @@ CheckAliveInterval = 3
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/ageich/wireproxy-awg/total.svg)](https://github.com/ageich/wireproxy-awg/releases)
 ```
-
----
