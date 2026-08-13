@@ -114,6 +114,23 @@ func (c *timeoutConn) Close() error {
 	return c.Conn.Close()
 }
 
+// CloseWrite preserves TCP half-close through the timeoutConn wrapper.
+// This is required by SOCKS5 Proxy() after EOF in one direction.
+func (c *timeoutConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// CloseRead preserves TCP half-close through the timeoutConn wrapper.
+func (c *timeoutConn) CloseRead() error {
+	if cr, ok := c.Conn.(closeReader); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
 // dialWithTimeout создаёт соединение через vt.Tnet.DialContext и оборачивает его в timeoutConn
 func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) (net.Conn, error) {
 	conn, err := vt.Tnet.DialContext(ctx, network, addr)
