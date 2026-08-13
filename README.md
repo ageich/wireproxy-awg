@@ -1,4 +1,3 @@
-```markdown
 [![ISC licensed](https://img.shields.io/badge/license-ISC-blue)](./LICENSE)
 [![Build status](https://github.com/ageich/wireproxy-awg/actions/workflows/build.yml/badge.svg)](https://github.com/ageich/wireproxy-awg/actions)
 [![Documentation](https://img.shields.io/badge/godoc-wireproxy--awg-blue)](https://pkg.go.dev/github.com/ageich/wireproxy-awg)
@@ -37,7 +36,6 @@
 ./wireproxy [-h|--help] [-c|--config "<значение>"] \
             [-s|--silent] [-d|--daemon] [-i|--info "<значение>"] \
             [-v|--version] [-n|--configtest] [--max-memory "<значение>"]
-```
 
 ```text
 usage: wireproxy [-h|--help] [-c|--config "<значение>"] [-s|--silent]
