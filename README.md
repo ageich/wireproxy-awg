@@ -5,6 +5,7 @@
 
 # wireproxy-awg
 
+Устранена утечка памяти по сравнению с оригинальной версией.
 Совместимый с AmneziaWG клиент WireGuard, представляющий себя как socks5/http прокси или туннель.  
 Форк от [wireproxy](https://github.com/windtf/wireproxy).
 
