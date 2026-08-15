@@ -41,14 +41,16 @@ var defaultDialer = &net.Dialer{
 
 var socksPool = bufferpool.NewPool(64 * 1024)
 
-// Ограничивает только одновременно выполняемые
-// операции:
+// Ограничивает только одновременно выполняемые операции:
 //
 //	resolve DNS + Dial
 //
 // После успешного Dial semaphore освобождается.
 // Длительные TCP-соединения semaphore НЕ занимают.
-var tcpSemaphore = make(chan struct{}, runtime.GOMAXPROCS(0)*256)
+var tcpSemaphore = make(
+	chan struct{},
+	runtime.GOMAXPROCS(0)*256,
+)
 
 // ---------- DNS перемешивание ----------
 
@@ -88,8 +90,11 @@ var errHalfCloseUnsupported = errors.New(
 
 // timeoutConn обновляет idle deadline только при необходимости.
 //
-// В отличие от предыдущей реализации здесь нет mutex на каждом
-// Read/Write. Это важно на высоком количестве TCP-соединений.
+// Внутри atomic.Int64 хранится deadline в UnixNano.
+//
+// Важно:
+// time.Duration нельзя напрямую вычитать из int64,
+// поэтому перед сравнением duration преобразуется через Nanoseconds().
 type timeoutConn struct {
 	net.Conn
 
@@ -105,17 +110,18 @@ func (c *timeoutConn) Read(p []byte) (int, error) {
 
 	deadline := c.readDeadline.Load()
 
-	refreshBefore := c.idle / 10
+	refreshBefore := (c.idle / 10).Nanoseconds()
 	if refreshBefore <= 0 {
-		refreshBefore = time.Nanosecond
+		refreshBefore = int64(time.Nanosecond)
 	}
 
 	if deadline == 0 || nowUnix >= deadline-refreshBefore {
 		newDeadline := now.Add(c.idle)
+		newDeadlineUnix := newDeadline.UnixNano()
 
 		if c.readDeadline.CompareAndSwap(
 			deadline,
-			newDeadline.UnixNano(),
+			newDeadlineUnix,
 		) {
 			_ = c.Conn.SetReadDeadline(newDeadline)
 		}
@@ -130,17 +136,18 @@ func (c *timeoutConn) Write(p []byte) (int, error) {
 
 	deadline := c.writeDeadline.Load()
 
-	refreshBefore := c.idle / 10
+	refreshBefore := (c.idle / 10).Nanoseconds()
 	if refreshBefore <= 0 {
-		refreshBefore = time.Nanosecond
+		refreshBefore = int64(time.Nanosecond)
 	}
 
 	if deadline == 0 || nowUnix >= deadline-refreshBefore {
 		newDeadline := now.Add(c.idle)
+		newDeadlineUnix := newDeadline.UnixNano()
 
 		if c.writeDeadline.CompareAndSwap(
 			deadline,
-			newDeadline.UnixNano(),
+			newDeadlineUnix,
 		) {
 			_ = c.Conn.SetWriteDeadline(newDeadline)
 		}
@@ -412,17 +419,14 @@ func (d *VirtualTun) resolveToAddrPort(
 
 // ---------- TCP Dial + semaphore ----------
 
-// dialTCPWithSemaphore ограничивает только установление
-// исходящего TCP-соединения.
-//
-// semaphore:
+// Ограничивает только установление исходящего TCP-соединения:
 //
 //	Acquire
-//	  |
-//	  +-- DNS resolve
-//	  |
-//	  +-- Tnet.DialContext
-//	  |
+//	    |
+//	    +-- DNS resolve
+//	    |
+//	    +-- Tnet.DialContext
+//	    |
 //	Release
 //
 // После Release TCP-соединение может жить часами,
@@ -552,10 +556,10 @@ func (config *Socks5Config) SpawnRoutine(
 			idle:     IdleTimeout,
 		}
 
-		go func() {
+		go func(l net.Listener) {
 			<-ctx.Done()
-			_ = rawListener.Close()
-		}()
+			_ = l.Close()
+		}(rawListener)
 
 		Log.Info(
 			"SOCKS5 server started",
@@ -617,7 +621,7 @@ func (config *HTTPConfig) SpawnRoutine(
 }
 
 // TCPClientTunnelConfig.BindAddress имеет тип *net.TCPAddr.
-// Поэтому здесь напрямую используется net.ListenTCP().
+// Поэтому используется net.ListenTCP().
 func (conf *TCPClientTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -630,6 +634,12 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(
 			"parse target %s: %w",
 			conf.Target,
 			err,
+		)
+	}
+
+	if conf.BindAddress == nil {
+		return errors.New(
+			"TCP client bind address is nil",
 		)
 	}
 
@@ -793,15 +803,15 @@ func closeReadOrClose(conn net.Conn) {
 
 // copyBidirectional выполняет full-duplex copy.
 //
-// При EOF в одном направлении:
+// При EOF:
 //
 //	a -> b:
-//	  CloseWrite(b)
-//	  CloseRead(a)
+//	    CloseWrite(b)
+//	    CloseRead(a)
 //
 //	b -> a:
-//	  CloseWrite(a)
-//	  CloseRead(b)
+//	    CloseWrite(a)
+//	    CloseRead(b)
 //
 // Это позволяет сохранять TCP half-close.
 func copyBidirectional(
@@ -859,8 +869,6 @@ func tcpClientForward(
 
 	defer conn.Close()
 
-	// semaphore освобождается внутри
-	// dialTCPWithSemaphore() сразу после Dial.
 	sconn, err := dialTCPWithSemaphore(
 		ctx,
 		vt,
@@ -882,7 +890,7 @@ func tcpClientForward(
 
 	defer sconn.Close()
 
-	// Длительное TCP-соединение semaphore НЕ занимает.
+	// semaphore уже освобождён.
 	copyBidirectional(
 		conn,
 		sconn,
@@ -1111,11 +1119,6 @@ func (d *VirtualTun) pingWorker() {
 	}
 }
 
-// stopPingWorkers сначала cancel,
-// затем ждёт завершения worker pool.
-//
-// Поля очищаются только после Wait(),
-// поэтому старый pool не пересекается с новым.
 func (d *VirtualTun) stopPingWorkers() {
 	d.pingMu.Lock()
 
@@ -1506,6 +1509,14 @@ func (d *VirtualTun) ServeHTTP(
 		_, _ = w.Write([]byte("\n"))
 
 	case "/metrics":
+		if d.Dev == nil {
+			w.WriteHeader(
+				http.StatusInternalServerError,
+			)
+
+			return
+		}
+
 		get, err := d.Dev.IpcGet()
 		if err != nil {
 			Log.Error(
@@ -1692,9 +1703,7 @@ func (d *VirtualTun) StopPingIPs() {
 	close(stop)
 	d.pingStop = nil
 
-	// pingStopMu удерживается здесь специально:
-	// это не позволяет параллельному StartPingIPs()
-	// создать второй ping loop до полного завершения
-	// предыдущего.
+	// Не разрешаем StartPingIPs() запустить новый
+	// ping loop до полного завершения старого.
 	d.pingLoopWg.Wait()
 }
