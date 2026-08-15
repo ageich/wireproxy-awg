@@ -27,7 +27,6 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-
 	"net/netip"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
@@ -42,9 +41,13 @@ var defaultDialer = &net.Dialer{
 
 var socksPool = bufferpool.NewPool(64 * 1024)
 
-// Семафор для ограничения количества одновременно устанавливаемых TCP-соединений.
-// Удерживается только во время resolve + dial и НЕ удерживается во время
-// длительного существования установленного TCP-соединения.
+// Ограничивает только одновременно выполняемые
+// операции:
+//
+//	resolve DNS + Dial
+//
+// После успешного Dial semaphore освобождается.
+// Длительные TCP-соединения semaphore НЕ занимают.
 var tcpSemaphore = make(chan struct{}, runtime.GOMAXPROCS(0)*256)
 
 // ---------- DNS перемешивание ----------
@@ -67,7 +70,7 @@ var icmpReadPool = sync.Pool{
 
 var pingSeq uint32
 
-// ---------- Интерфейсы для half-close ----------
+// ---------- Интерфейсы half-close ----------
 
 type closeWriter interface {
 	CloseWrite() error
@@ -77,64 +80,118 @@ type closeReader interface {
 	CloseRead() error
 }
 
-// ---------- timeoutConn с оптимизированной установкой дедлайна ----------
+var errHalfCloseUnsupported = errors.New(
+	"half-close is not supported",
+)
 
+// ---------- timeoutConn ----------
+
+// timeoutConn обновляет idle deadline только при необходимости.
+//
+// В отличие от предыдущей реализации здесь нет mutex на каждом
+// Read/Write. Это важно на высоком количестве TCP-соединений.
 type timeoutConn struct {
 	net.Conn
-	idle          time.Duration
-	readDeadline  time.Time
-	writeDeadline time.Time
-	mu            sync.Mutex
+
+	idle time.Duration
+
+	readDeadline  atomic.Int64
+	writeDeadline atomic.Int64
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
 	now := time.Now()
-	if c.readDeadline.IsZero() || now.After(c.readDeadline.Add(-c.idle/10)) {
-		c.readDeadline = now.Add(c.idle)
-		_ = c.Conn.SetReadDeadline(c.readDeadline)
+	nowUnix := now.UnixNano()
+
+	deadline := c.readDeadline.Load()
+
+	refreshBefore := c.idle / 10
+	if refreshBefore <= 0 {
+		refreshBefore = time.Nanosecond
 	}
-	c.mu.Unlock()
+
+	if deadline == 0 || nowUnix >= deadline-refreshBefore {
+		newDeadline := now.Add(c.idle)
+
+		if c.readDeadline.CompareAndSwap(
+			deadline,
+			newDeadline.UnixNano(),
+		) {
+			_ = c.Conn.SetReadDeadline(newDeadline)
+		}
+	}
+
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
 	now := time.Now()
-	if c.writeDeadline.IsZero() || now.After(c.writeDeadline.Add(-c.idle/10)) {
-		c.writeDeadline = now.Add(c.idle)
-		_ = c.Conn.SetWriteDeadline(c.writeDeadline)
+	nowUnix := now.UnixNano()
+
+	deadline := c.writeDeadline.Load()
+
+	refreshBefore := c.idle / 10
+	if refreshBefore <= 0 {
+		refreshBefore = time.Nanosecond
 	}
-	c.mu.Unlock()
+
+	if deadline == 0 || nowUnix >= deadline-refreshBefore {
+		newDeadline := now.Add(c.idle)
+
+		if c.writeDeadline.CompareAndSwap(
+			deadline,
+			newDeadline.UnixNano(),
+		) {
+			_ = c.Conn.SetWriteDeadline(newDeadline)
+		}
+	}
+
 	return c.Conn.Write(p)
 }
 
 func (c *timeoutConn) Close() error {
-	_ = c.Conn.SetReadDeadline(time.Now())
-	_ = c.Conn.SetWriteDeadline(time.Now())
 	return c.Conn.Close()
 }
 
-// CloseWrite preserves TCP half-close through the timeoutConn wrapper.
-// This is required by SOCKS5 Proxy() after EOF in one direction.
+// CloseWrite сохраняет TCP half-close.
+//
+// Если underlying connection поддерживает CloseWrite,
+// используется он. Иначе возвращается ошибка.
 func (c *timeoutConn) CloseWrite() error {
 	if cw, ok := c.Conn.(closeWriter); ok {
 		return cw.CloseWrite()
 	}
-	return nil
+
+	return errHalfCloseUnsupported
 }
 
-// CloseRead preserves TCP half-close through the timeoutConn wrapper.
+// CloseRead сохраняет TCP half-close.
+//
+// Если underlying connection поддерживает CloseRead,
+// используется он. Иначе возвращается ошибка.
 func (c *timeoutConn) CloseRead() error {
 	if cr, ok := c.Conn.(closeReader); ok {
 		return cr.CloseRead()
 	}
-	return nil
+
+	return errHalfCloseUnsupported
 }
 
-// dialWithTimeout создаёт соединение через vt.Tnet.DialContext и оборачивает его в timeoutConn
-func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) (net.Conn, error) {
-	conn, err := vt.Tnet.DialContext(ctx, network, addr)
+// ---------- Dial ----------
+
+// dialWithTimeout создаёт соединение через vt.Tnet.DialContext
+// и оборачивает его в timeoutConn.
+func dialWithTimeout(
+	ctx context.Context,
+	network string,
+	addr string,
+	vt *VirtualTun,
+) (net.Conn, error) {
+	conn, err := vt.Tnet.DialContext(
+		ctx,
+		network,
+		addr,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +202,8 @@ func dialWithTimeout(ctx context.Context, network, addr string, vt *VirtualTun) 
 	}, nil
 }
 
-// timeoutListener оборачивает net.Listener и возвращает timeoutConn для каждого принятого соединения
+// ---------- timeoutListener ----------
+
 type timeoutListener struct {
 	net.Listener
 	idle time.Duration
@@ -170,9 +228,20 @@ type CredentialValidator struct {
 	password string
 }
 
-func (c CredentialValidator) Valid(username, password string) bool {
-	u := subtle.ConstantTimeCompare([]byte(c.username), []byte(username))
-	p := subtle.ConstantTimeCompare([]byte(c.password), []byte(password))
+func (c CredentialValidator) Valid(
+	username,
+	password string,
+) bool {
+	u := subtle.ConstantTimeCompare(
+		[]byte(c.username),
+		[]byte(username),
+	)
+
+	p := subtle.ConstantTimeCompare(
+		[]byte(c.password),
+		[]byte(password),
+	)
+
 	return u&p == 1
 }
 
@@ -194,7 +263,7 @@ type VirtualTun struct {
 	UdpSessionCacheSize int
 	DnsTtl              time.Duration
 
-	// Поля для ping workers – защищены мьютексом
+	// Ping worker pool.
 	pingMu             sync.Mutex
 	pingJobs           chan pingJob
 	pingWorkers        sync.WaitGroup
@@ -221,15 +290,27 @@ type addressPort struct {
 
 // ---------- Вспомогательные функции ----------
 
-func (d *VirtualTun) LookupAddr(ctx context.Context, name string) ([]string, error) {
+func (d *VirtualTun) LookupAddr(
+	ctx context.Context,
+	name string,
+) ([]string, error) {
 	if d.SystemDNS {
-		return net.DefaultResolver.LookupHost(ctx, name)
+		return net.DefaultResolver.LookupHost(
+			ctx,
+			name,
+		)
 	}
 
-	return d.Tnet.LookupContextHost(ctx, name)
+	return d.Tnet.LookupContextHost(
+		ctx,
+		name,
+	)
 }
 
-func (d *VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*netip.Addr, error) {
+func (d *VirtualTun) ResolveAddrWithContext(
+	ctx context.Context,
+	name string,
+) (*netip.Addr, error) {
 	addrs, err := d.LookupAddr(ctx, name)
 	if err != nil {
 		return nil, err
@@ -237,13 +318,21 @@ func (d *VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*
 
 	size := len(addrs)
 	if size == 0 {
-		return nil, errors.New("no address found for: " + name)
+		return nil, errors.New(
+			"no address found for: " + name,
+		)
 	}
 
 	dnsRandMu.Lock()
-	dnsRand.Shuffle(size, func(i, j int) {
-		addrs[i], addrs[j] = addrs[j], addrs[i]
-	})
+
+	dnsRand.Shuffle(
+		size,
+		func(i, j int) {
+			addrs[i], addrs[j] =
+				addrs[j], addrs[i]
+		},
+	)
+
 	dnsRandMu.Unlock()
 
 	var addr netip.Addr
@@ -262,8 +351,14 @@ func (d *VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*
 	return &addr, nil
 }
 
-func (d *VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	addr, err := d.ResolveAddrWithContext(ctx, name)
+func (d *VirtualTun) Resolve(
+	ctx context.Context,
+	name string,
+) (context.Context, net.IP, error) {
+	addr, err := d.ResolveAddrWithContext(
+		ctx,
+		name,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -271,7 +366,9 @@ func (d *VirtualTun) Resolve(ctx context.Context, name string) (context.Context,
 	return ctx, addr.AsSlice(), nil
 }
 
-func parseAddressPort(endpoint string) (*addressPort, error) {
+func parseAddressPort(
+	endpoint string,
+) (*addressPort, error) {
 	name, sport, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return nil, err
@@ -280,8 +377,10 @@ func parseAddressPort(endpoint string) (*addressPort, error) {
 	port, err := strconv.Atoi(sport)
 	if err != nil || port < 0 || port > 65535 {
 		return nil, &net.OpError{
-			Op:  "dial",
-			Err: errors.New("port must be numeric"),
+			Op: "dial",
+			Err: errors.New(
+				"port must be numeric",
+			),
 		}
 	}
 
@@ -291,36 +390,122 @@ func parseAddressPort(endpoint string) (*addressPort, error) {
 	}, nil
 }
 
-func (d *VirtualTun) resolveToAddrPort(ctx context.Context, endpoint *addressPort) (*netip.AddrPort, error) {
-	addr, err := d.ResolveAddrWithContext(ctx, endpoint.address)
+func (d *VirtualTun) resolveToAddrPort(
+	ctx context.Context,
+	endpoint *addressPort,
+) (*netip.AddrPort, error) {
+	addr, err := d.ResolveAddrWithContext(
+		ctx,
+		endpoint.address,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	addrPort := netip.AddrPortFrom(*addr, endpoint.port)
+	addrPort := netip.AddrPortFrom(
+		*addr,
+		endpoint.port,
+	)
+
 	return &addrPort, nil
+}
+
+// ---------- TCP Dial + semaphore ----------
+
+// dialTCPWithSemaphore ограничивает только установление
+// исходящего TCP-соединения.
+//
+// semaphore:
+//
+//	Acquire
+//	  |
+//	  +-- DNS resolve
+//	  |
+//	  +-- Tnet.DialContext
+//	  |
+//	Release
+//
+// После Release TCP-соединение может жить часами,
+// не занимая semaphore.
+func dialTCPWithSemaphore(
+	ctx context.Context,
+	vt *VirtualTun,
+	raddr *addressPort,
+) (net.Conn, error) {
+	select {
+	case tcpSemaphore <- struct{}{}:
+		defer func() {
+			<-tcpSemaphore
+		}()
+
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	target, err := vt.resolveToAddrPort(
+		ctx,
+		raddr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tcpAddr := net.TCPAddrFromAddrPort(
+		*target,
+	)
+
+	return dialWithTimeout(
+		ctx,
+		"tcp",
+		tcpAddr.String(),
+		vt,
+	)
 }
 
 // ---------- SpawnRoutine implementations ----------
 
-func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	resolver := NewFixedResolver(vt.Tnet, vt.SystemDNS, vt.DnsTtl, vt.DnsCacheSize)
+func (config *Socks5Config) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	resolver := NewFixedResolver(
+		vt.Tnet,
+		vt.SystemDNS,
+		vt.DnsTtl,
+		vt.DnsCacheSize,
+	)
+
 	config.resolver = resolver
 
 	var authMethods []socks5.Authenticator
 
 	if username := config.Username; username != "" {
-		authMethods = append(authMethods, socks5.UserPassAuthenticator{
-			Credentials: socks5.StaticCredentials{
-				username: config.Password,
+		authMethods = append(
+			authMethods,
+			socks5.UserPassAuthenticator{
+				Credentials: socks5.StaticCredentials{
+					username: config.Password,
+				},
 			},
-		})
+		)
 	} else {
-		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
+		authMethods = append(
+			authMethods,
+			socks5.NoAuthAuthenticator{},
+		)
 	}
 
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialWithTimeout(ctx, network, addr, vt)
+	dial := func(
+		ctx context.Context,
+		network,
+		addr string,
+	) (net.Conn, error) {
+		return dialWithTimeout(
+			ctx,
+			network,
+			addr,
+			vt,
+		)
 	}
 
 	options := []socks5.Option{
@@ -337,13 +522,28 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 		select {
 		case <-ctx.Done():
 			return nil
+
 		default:
 		}
 
-		rawListener, err := net.Listen("tcp", config.BindAddress)
+		rawListener, err := net.Listen(
+			"tcp",
+			config.BindAddress,
+		)
 		if err != nil {
-			Log.Error("Failed to listen", "error", err)
-			time.Sleep(5 * time.Second)
+			Log.Error(
+				"Failed to listen",
+				"error",
+				err,
+			)
+
+			select {
+			case <-ctx.Done():
+				return nil
+
+			case <-time.After(5 * time.Second):
+			}
+
 			continue
 		}
 
@@ -354,14 +554,19 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 
 		go func() {
 			<-ctx.Done()
-			rawListener.Close()
+			_ = rawListener.Close()
 		}()
 
-		Log.Info("SOCKS5 server started", "bind", config.BindAddress)
+		Log.Info(
+			"SOCKS5 server started",
+			"bind",
+			config.BindAddress,
+		)
 
 		err = server.Serve(listener)
 
 		if ctx.Err() != nil {
+			_ = rawListener.Close()
 			return nil
 		}
 
@@ -371,52 +576,80 @@ func (config *Socks5Config) SpawnRoutine(ctx context.Context, vt *VirtualTun) er
 			err,
 		)
 
-		rawListener.Close()
-		time.Sleep(5 * time.Second)
-	}
-}
+		_ = rawListener.Close()
 
-func (config *HTTPConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	server := NewHTTPServer(config, vt.Tnet.Dial)
-
-	if err := server.ListenAndServe(ctx, "tcp", config.BindAddress); err != nil {
 		select {
 		case <-ctx.Done():
 			return nil
+
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (config *HTTPConfig) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	server := NewHTTPServer(
+		config,
+		vt.Tnet.Dial,
+	)
+
+	if err := server.ListenAndServe(
+		ctx,
+		"tcp",
+		config.BindAddress,
+	); err != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+
 		default:
-			return fmt.Errorf("HTTP server error: %w", err)
+			return fmt.Errorf(
+				"HTTP server error: %w",
+				err,
+			)
 		}
 	}
 
 	return nil
 }
 
-func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	raddr, err := parseAddressPort(conf.Target)
+// TCPClientTunnelConfig.BindAddress имеет тип *net.TCPAddr.
+// Поэтому здесь напрямую используется net.ListenTCP().
+func (conf *TCPClientTunnelConfig) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	raddr, err := parseAddressPort(
+		conf.Target,
+	)
 	if err != nil {
-		return fmt.Errorf("parse target %s: %w", conf.Target, err)
+		return fmt.Errorf(
+			"parse target %s: %w",
+			conf.Target,
+			err,
+		)
 	}
 
-	server, err := net.ListenTCP("tcp", conf.BindAddress)
+	server, err := net.ListenTCP(
+		"tcp",
+		conf.BindAddress,
+	)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", conf.BindAddress, err)
+		return fmt.Errorf(
+			"listen on %s: %w",
+			conf.BindAddress,
+			err,
+		)
 	}
 
 	defer server.Close()
 
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error(
-					"TCPClient listener goroutine panicked",
-					"recover",
-					r,
-				)
-			}
-		}()
-
 		<-ctx.Done()
-		server.Close()
+		_ = server.Close()
 	}()
 
 	for {
@@ -425,30 +658,61 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 			select {
 			case <-ctx.Done():
 				return nil
+
 			default:
-				return fmt.Errorf("accept error: %w", err)
+				return fmt.Errorf(
+					"accept error: %w",
+					err,
+				)
 			}
 		}
 
-		go tcpClientForward(ctx, vt, raddr, conn)
+		go tcpClientForward(
+			ctx,
+			vt,
+			raddr,
+			conn,
+		)
 	}
 }
 
-func (conf *STDIOTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	raddr, err := parseAddressPort(conf.Target)
+func (conf *STDIOTunnelConfig) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	raddr, err := parseAddressPort(
+		conf.Target,
+	)
 	if err != nil {
-		return fmt.Errorf("parse target %s: %w", conf.Target, err)
+		return fmt.Errorf(
+			"parse target %s: %w",
+			conf.Target,
+			err,
+		)
 	}
 
-	go STDIOTcpForward(ctx, vt, raddr)
+	go STDIOTcpForward(
+		ctx,
+		vt,
+		raddr,
+	)
 
 	return nil
 }
 
-func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	raddr, err := parseAddressPort(conf.Target)
+func (conf *TCPServerTunnelConfig) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	raddr, err := parseAddressPort(
+		conf.Target,
+	)
 	if err != nil {
-		return fmt.Errorf("parse target %s: %w", conf.Target, err)
+		return fmt.Errorf(
+			"parse target %s: %w",
+			conf.Target,
+			err,
+		)
 	}
 
 	addr := &net.TCPAddr{
@@ -467,18 +731,8 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 	defer server.Close()
 
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Log.Error(
-					"TCPServer listener goroutine panicked",
-					"recover",
-					r,
-				)
-			}
-		}()
-
 		<-ctx.Done()
-		server.Close()
+		_ = server.Close()
 	}()
 
 	for {
@@ -487,78 +741,105 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(ctx context.Context, vt *Virtual
 			select {
 			case <-ctx.Done():
 				return nil
+
 			default:
-				return fmt.Errorf("accept error: %w", err)
+				return fmt.Errorf(
+					"accept error: %w",
+					err,
+				)
 			}
 		}
 
-		go tcpServerForward(ctx, vt, raddr, conn)
+		go tcpServerForward(
+			ctx,
+			vt,
+			raddr,
+			conn,
+		)
 	}
 }
 
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(ctx context.Context, vt *VirtualTun) error {
-	return conf.SpawnUDPProxy(ctx, vt)
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(
+	ctx context.Context,
+	vt *VirtualTun,
+) error {
+	return conf.SpawnUDPProxy(
+		ctx,
+		vt,
+	)
 }
 
-// ---------- Копирование данных с CloseRead/CloseWrite и пулом буферов ----------
+// ---------- Bidirectional copy ----------
 
-// copyBidirectional копирует данные в обе стороны.
-// Если соединение поддерживает half-close, используется CloseWrite/CloseRead,
-// иначе вызывается Close() (что может закрыть второе направление – допустимо).
-func copyBidirectional(a, b net.Conn) {
+func closeWriteOrClose(conn net.Conn) {
+	if cw, ok := conn.(closeWriter); ok {
+		if err := cw.CloseWrite(); err == nil {
+			return
+		}
+	}
+
+	_ = conn.Close()
+}
+
+func closeReadOrClose(conn net.Conn) {
+	if cr, ok := conn.(closeReader); ok {
+		if err := cr.CloseRead(); err == nil {
+			return
+		}
+	}
+
+	_ = conn.Close()
+}
+
+// copyBidirectional выполняет full-duplex copy.
+//
+// При EOF в одном направлении:
+//
+//	a -> b:
+//	  CloseWrite(b)
+//	  CloseRead(a)
+//
+//	b -> a:
+//	  CloseWrite(a)
+//	  CloseRead(b)
+//
+// Это позволяет сохранять TCP half-close.
+func copyBidirectional(
+	a,
+	b net.Conn,
+) {
 	var wg sync.WaitGroup
-	var closeA, closeB sync.Once
 
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 
-		_, _ = CopyWithPool(b, a)
+		_, _ = CopyWithPool(
+			b,
+			a,
+		)
 
-		closeB.Do(func() {
-			if cw, ok := b.(closeWriter); ok {
-				_ = cw.CloseWrite()
-			} else {
-				_ = b.Close()
-			}
-		})
-
-		closeA.Do(func() {
-			if cr, ok := a.(closeReader); ok {
-				_ = cr.CloseRead()
-			} else {
-				_ = a.Close()
-			}
-		})
+		closeWriteOrClose(b)
+		closeReadOrClose(a)
 	}()
 
 	go func() {
 		defer wg.Done()
 
-		_, _ = CopyWithPool(a, b)
+		_, _ = CopyWithPool(
+			a,
+			b,
+		)
 
-		closeA.Do(func() {
-			if cw, ok := a.(closeWriter); ok {
-				_ = cw.CloseWrite()
-			} else {
-				_ = a.Close()
-			}
-		})
-
-		closeB.Do(func() {
-			if cr, ok := b.(closeReader); ok {
-				_ = cr.CloseRead()
-			} else {
-				_ = b.Close()
-			}
-		})
+		closeWriteOrClose(a)
+		closeReadOrClose(b)
 	}()
 
 	wg.Wait()
 }
 
-// ---------- TCP-туннели с семафором только на resolve + Dial ----------
+// ---------- TCP tunnels ----------
 
 func tcpClientForward(
 	ctx context.Context,
@@ -578,37 +859,13 @@ func tcpClientForward(
 
 	defer conn.Close()
 
-	// Семафор ограничивает только установление соединения:
-	// resolve DNS + Dial.
-	//
-	// После успешного Dial семафор немедленно освобождается.
-	// copyBidirectional() выполняется уже БЕЗ семафора.
-	sconn, err := func() (net.Conn, error) {
-		select {
-		case tcpSemaphore <- struct{}{}:
-			defer func() {
-				<-tcpSemaphore
-			}()
-
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		target, err := vt.resolveToAddrPort(ctx, raddr)
-		if err != nil {
-			return nil, err
-		}
-
-		tcpAddr := net.TCPAddrFromAddrPort(*target)
-
-		return dialWithTimeout(
-			ctx,
-			"tcp",
-			tcpAddr.String(),
-			vt,
-		)
-	}()
-
+	// semaphore освобождается внутри
+	// dialTCPWithSemaphore() сразу после Dial.
+	sconn, err := dialTCPWithSemaphore(
+		ctx,
+		vt,
+		raddr,
+	)
 	if err != nil {
 		Log.Error(
 			"TCP Client Tunnel dial error",
@@ -619,13 +876,17 @@ func tcpClientForward(
 			"error",
 			err,
 		)
+
 		return
 	}
 
 	defer sconn.Close()
 
-	// ВАЖНО: semaphore уже освобождён.
-	copyBidirectional(conn, sconn)
+	// Длительное TCP-соединение semaphore НЕ занимает.
+	copyBidirectional(
+		conn,
+		sconn,
+	)
 }
 
 func tcpServerForward(
@@ -646,34 +907,11 @@ func tcpServerForward(
 
 	defer conn.Close()
 
-	// Семафор ограничивает только resolve + Dial.
-	// После возврата из этой функции-замыкания слот свободен.
-	sconn, err := func() (net.Conn, error) {
-		select {
-		case tcpSemaphore <- struct{}{}:
-			defer func() {
-				<-tcpSemaphore
-			}()
-
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		target, err := vt.resolveToAddrPort(ctx, raddr)
-		if err != nil {
-			return nil, err
-		}
-
-		tcpAddr := net.TCPAddrFromAddrPort(*target)
-
-		return dialWithTimeout(
-			ctx,
-			"tcp",
-			tcpAddr.String(),
-			vt,
-		)
-	}()
-
+	sconn, err := dialTCPWithSemaphore(
+		ctx,
+		vt,
+		raddr,
+	)
 	if err != nil {
 		Log.Error(
 			"TCP Server Tunnel dial error",
@@ -684,13 +922,16 @@ func tcpServerForward(
 			"error",
 			err,
 		)
+
 		return
 	}
 
 	defer sconn.Close()
 
-	// Длительное соединение не удерживает tcpSemaphore.
-	copyBidirectional(conn, sconn)
+	copyBidirectional(
+		conn,
+		sconn,
+	)
 }
 
 func STDIOTcpForward(
@@ -708,33 +949,11 @@ func STDIOTcpForward(
 		}
 	}()
 
-	// Семафор используется только для resolve + Dial.
-	sconn, err := func() (net.Conn, error) {
-		select {
-		case tcpSemaphore <- struct{}{}:
-			defer func() {
-				<-tcpSemaphore
-			}()
-
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		target, err := vt.resolveToAddrPort(ctx, raddr)
-		if err != nil {
-			return nil, err
-		}
-
-		tcpAddr := net.TCPAddrFromAddrPort(*target)
-
-		return dialWithTimeout(
-			ctx,
-			"tcp",
-			tcpAddr.String(),
-			vt,
-		)
-	}()
-
+	sconn, err := dialTCPWithSemaphore(
+		ctx,
+		vt,
+		raddr,
+	)
 	if err != nil {
 		Log.Error(
 			"STDIO TCP Tunnel dial error",
@@ -745,6 +964,7 @@ func STDIOTcpForward(
 			"error",
 			err,
 		)
+
 		return
 	}
 
@@ -761,6 +981,7 @@ func STDIOTcpForward(
 			"error",
 			err,
 		)
+
 		return
 	}
 
@@ -779,11 +1000,7 @@ func STDIOTcpForward(
 			os.Stdin,
 		)
 
-		if cw, ok := sconn.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		} else {
-			_ = sconn.Close()
-		}
+		closeWriteOrClose(sconn)
 
 		select {
 		case done <- struct{}{}:
@@ -799,11 +1016,7 @@ func STDIOTcpForward(
 			sconn,
 		)
 
-		if cr, ok := sconn.(closeReader); ok {
-			_ = cr.CloseRead()
-		} else {
-			_ = sconn.Close()
-		}
+		closeReadOrClose(sconn)
 
 		select {
 		case done <- struct{}{}:
@@ -824,7 +1037,7 @@ func STDIOTcpForward(
 	wg.Wait()
 }
 
-// ---------- ICMP ping с worker pool (полностью безопасная версия) ----------
+// ---------- ICMP ping worker pool ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	d.pingMu.Lock()
@@ -834,37 +1047,50 @@ func (d *VirtualTun) initPingWorkers() {
 		return
 	}
 
-	if d.pingJobs == nil {
-		d.pingCtx, d.pingCancel = context.WithCancel(
-			context.Background(),
-		)
+	pingCtx, cancel := context.WithCancel(
+		context.Background(),
+	)
 
-		workers := runtime.GOMAXPROCS(0)
-		if workers < 2 {
-			workers = 2
-		}
+	workers := runtime.GOMAXPROCS(0)
 
-		queueSize := workers * 16
-		d.pingJobs = make(chan pingJob, queueSize)
-
-		for i := 0; i < workers; i++ {
-			d.pingWorkers.Add(1)
-			go d.pingWorker()
-		}
-
-		d.pingWorkersStarted = true
+	if workers < 2 {
+		workers = 2
 	}
+
+	queueSize := workers * 8
+
+	if queueSize < 16 {
+		queueSize = 16
+	}
+
+	if queueSize > 256 {
+		queueSize = 256
+	}
+
+	d.pingCtx = pingCtx
+	d.pingCancel = cancel
+
+	d.pingJobs = make(
+		chan pingJob,
+		queueSize,
+	)
+
+	for i := 0; i < workers; i++ {
+		d.pingWorkers.Add(1)
+		go d.pingWorker()
+	}
+
+	d.pingWorkersStarted = true
 }
 
-// pingWorker теперь использует локальные копии канала и контекста,
-// полученные под мьютексом при старте, чтобы не зависеть от изменений полей.
 func (d *VirtualTun) pingWorker() {
 	defer d.pingWorkers.Done()
 
-	// Захватываем локальные копии под мьютексом.
 	d.pingMu.Lock()
+
 	jobs := d.pingJobs
 	ctx := d.pingCtx
+
 	d.pingMu.Unlock()
 
 	if jobs == nil || ctx == nil {
@@ -876,13 +1102,7 @@ func (d *VirtualTun) pingWorker() {
 		case <-ctx.Done():
 			return
 
-		case job, ok := <-jobs:
-			if !ok {
-				// Канал закрыт – но мы его не закрываем,
-				// оставлено на случай будущего использования.
-				return
-			}
-
+		case job := <-jobs:
 			d.doPing(
 				job.addr,
 				job.requestPing,
@@ -891,8 +1111,12 @@ func (d *VirtualTun) pingWorker() {
 	}
 }
 
+// stopPingWorkers сначала cancel,
+// затем ждёт завершения worker pool.
+//
+// Поля очищаются только после Wait(),
+// поэтому старый pool не пересекается с новым.
 func (d *VirtualTun) stopPingWorkers() {
-	// Захватываем мьютекс, обнуляем поля и копируем cancel-функцию.
 	d.pingMu.Lock()
 
 	if !d.pingWorkersStarted {
@@ -902,29 +1126,32 @@ func (d *VirtualTun) stopPingWorkers() {
 
 	cancel := d.pingCancel
 
-	// Немедленно обнуляем все поля, чтобы новые вызовы
-	// не увидели старый канал.
+	d.pingMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	d.pingWorkers.Wait()
+
+	d.pingMu.Lock()
+
 	d.pingCancel = nil
 	d.pingCtx = nil
 	d.pingJobs = nil
 	d.pingWorkersStarted = false
 
 	d.pingMu.Unlock()
-
-	// Отменяем контекст – воркеры выйдут по Done().
-	if cancel != nil {
-		cancel()
-	}
-
-	// Ждём завершения всех воркеров.
-	// Мьютекс уже отпущен.
-	d.pingWorkers.Wait()
 }
 
 func (d *VirtualTun) doPing(
 	addr netip.Addr,
 	requestPing icmp.Echo,
 ) {
+	if d.Tnet == nil {
+		return
+	}
+
 	socket, err := d.Tnet.Dial(
 		"ping",
 		addr.String(),
@@ -937,12 +1164,14 @@ func (d *VirtualTun) doPing(
 			"error",
 			err,
 		)
+
 		return
 	}
 
 	defer socket.Close()
 
 	var data [16]byte
+
 	copy(
 		data[:],
 		requestPing.Data,
@@ -953,39 +1182,66 @@ func (d *VirtualTun) doPing(
 		Data: data[:],
 	}
 
-	var icmpBytes []byte
+	var (
+		icmpBytes []byte
+		proto     int
+	)
 
 	if addr.Is4() {
-		icmpBytes, _ = (&icmp.Message{
+		proto = 1
+
+		message := &icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
 			Code: 0,
 			Body: &reqPing,
-		}).Marshal(nil)
+		}
+
+		icmpBytes, err = message.Marshal(nil)
 	} else if addr.Is6() {
-		icmpBytes, _ = (&icmp.Message{
+		proto = 58
+
+		message := &icmp.Message{
 			Type: ipv6.ICMPTypeEchoRequest,
 			Code: 0,
 			Body: &reqPing,
-		}).Marshal(nil)
+		}
+
+		icmpBytes, err = message.Marshal(nil)
 	} else {
 		Log.Error(
 			"Failed to ping: invalid address",
 			"address",
 			addr,
 		)
+
 		return
 	}
 
+	if err != nil {
+		Log.Error(
+			"Failed to marshal ping",
+			"address",
+			addr,
+			"error",
+			err,
+		)
+
+		return
+	}
+
+	timeout := time.Duration(
+		d.Conf.CheckAliveInterval,
+	) * time.Second
+
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
 	_ = socket.SetReadDeadline(
-		time.Now().Add(
-			time.Duration(
-				d.Conf.CheckAliveInterval,
-			) * time.Second,
-		),
+		time.Now().Add(timeout),
 	)
 
-	_, err = socket.Write(icmpBytes)
-	if err != nil {
+	if _, err = socket.Write(icmpBytes); err != nil {
 		Log.Error(
 			"Failed to ping: write error",
 			"address",
@@ -993,11 +1249,13 @@ func (d *VirtualTun) doPing(
 			"error",
 			err,
 		)
+
 		return
 	}
 
 	bufPtr := icmpReadPool.Get().(*[]byte)
 	readBuf := *bufPtr
+
 	defer icmpReadPool.Put(bufPtr)
 
 	n, err := socket.Read(readBuf)
@@ -1009,21 +1267,11 @@ func (d *VirtualTun) doPing(
 			"error",
 			err,
 		)
+
 		return
 	}
 
-	var proto int
-
-	if addr.Is4() {
-		proto = 1
-	} else if addr.Is6() {
-		proto = 58
-	} else {
-		Log.Error(
-			"Failed to parse ping response: invalid address type",
-			"address",
-			addr,
-		)
+	if n <= 0 || n > len(readBuf) {
 		return
 	}
 
@@ -1039,6 +1287,7 @@ func (d *VirtualTun) doPing(
 			"error",
 			err,
 		)
+
 		return
 	}
 
@@ -1052,6 +1301,7 @@ func (d *VirtualTun) doPing(
 				"type",
 				replyPacket.Type,
 			)
+
 			return
 		}
 
@@ -1066,9 +1316,10 @@ func (d *VirtualTun) doPing(
 				"reply",
 				replyPing,
 			)
+
 			return
 		}
-	} else if addr.Is6() {
+	} else {
 		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
 		if !ok {
 			Log.Error(
@@ -1078,6 +1329,7 @@ func (d *VirtualTun) doPing(
 				"type",
 				replyPacket.Type,
 			)
+
 			return
 		}
 
@@ -1087,6 +1339,7 @@ func (d *VirtualTun) doPing(
 				"address",
 				addr,
 			)
+
 			return
 		}
 
@@ -1107,8 +1360,13 @@ func (d *VirtualTun) doPing(
 				"reply",
 				replyPing,
 			)
+
 			return
 		}
+	}
+
+	if d.PingRecord == nil {
+		return
 	}
 
 	d.PingRecord.Add(
@@ -1118,26 +1376,31 @@ func (d *VirtualTun) doPing(
 }
 
 func (d *VirtualTun) pingIPs() {
-	// Копируем канал и контекст под мьютексом.
 	d.pingMu.Lock()
+
 	pingJobs := d.pingJobs
 	pingCtx := d.pingCtx
+
 	d.pingMu.Unlock()
 
 	if pingJobs == nil || pingCtx == nil {
 		return
 	}
 
-	// Проверяем, не отменён ли контекст перед отправкой.
 	select {
 	case <-pingCtx.Done():
 		return
+
 	default:
 	}
 
 	seq := atomic.AddUint32(
 		&pingSeq,
 		1,
+	)
+
+	nowUnixNano := uint64(
+		time.Now().UnixNano(),
 	)
 
 	for _, addr := range d.Conf.CheckAlive {
@@ -1150,7 +1413,7 @@ func (d *VirtualTun) pingIPs() {
 
 		binary.BigEndian.PutUint64(
 			data[8:],
-			uint64(time.Now().UnixNano()),
+			nowUnixNano,
 		)
 
 		requestPing := icmp.Echo{
@@ -1170,49 +1433,63 @@ func (d *VirtualTun) pingIPs() {
 	}
 }
 
-// ---------- Health check и метрики (без лишнего логирования, с защитой от nil) ----------
+// ---------- HTTP health / metrics ----------
 
 func (d *VirtualTun) ServeHTTP(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	defer func() {
-		if r := recover(); r != nil {
+		if recovered := recover(); recovered != nil {
 			Log.Error(
 				"ServeHTTP panicked",
 				"recover",
-				r,
+				recovered,
 			)
-			w.WriteHeader(http.StatusInternalServerError)
+
+			w.WriteHeader(
+				http.StatusInternalServerError,
+			)
 		}
 	}()
 
-	// Не логируем стандартные health-запросы для снижения шума.
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
 		if d.PingRecord == nil {
 			w.WriteHeader(
 				http.StatusServiceUnavailable,
 			)
+
 			return
 		}
 
 		now := time.Now()
+
+		interval := time.Duration(
+			d.Conf.CheckAliveInterval,
+		) * time.Second
+
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+
+		ttl := interval + 2*time.Second
+
 		ok := true
 
 		for _, addr := range d.Conf.CheckAlive {
 			key := addr.String()
 
-			if val, okRec := d.PingRecord.Get(key); okRec {
-				if now.Sub(
-					time.Unix(int64(val), 0),
-				) > time.Duration(
-					d.Conf.CheckAliveInterval+2,
-				)*time.Second {
-					ok = false
-					break
-				}
-			} else {
+			val, okRec := d.PingRecord.Get(key)
+
+			if !okRec || val == 0 {
+				ok = false
+				break
+			}
+
+			if now.Sub(
+				time.Unix(int64(val), 0),
+			) > ttl {
 				ok = false
 				break
 			}
@@ -1236,9 +1513,11 @@ func (d *VirtualTun) ServeHTTP(
 				"error",
 				err,
 			)
+
 			w.WriteHeader(
 				http.StatusInternalServerError,
 			)
+
 			return
 		}
 
@@ -1263,6 +1542,7 @@ func (d *VirtualTun) ServeHTTP(
 
 			if len(pair) != 2 {
 				buf.WriteString(line)
+				buf.WriteByte('\n')
 				continue
 			}
 
@@ -1272,13 +1552,16 @@ func (d *VirtualTun) ServeHTTP(
 			}
 
 			buf.WriteString(pair[0])
-			buf.WriteString("=")
+			buf.WriteByte('=')
 			buf.WriteString(pair[1])
-			buf.WriteString("\n")
+			buf.WriteByte('\n')
 		}
 
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(buf.Bytes())
+
+		_, _ = w.Write(
+			buf.Bytes(),
+		)
 
 	default:
 		Log.Info(
@@ -1286,11 +1569,14 @@ func (d *VirtualTun) ServeHTTP(
 			"path",
 			r.URL.Path,
 		)
-		w.WriteHeader(http.StatusNotFound)
+
+		w.WriteHeader(
+			http.StatusNotFound,
+		)
 	}
 }
 
-// ---------- Старт/стоп пингов (исправлен размер LRU, защита от nil) ----------
+// ---------- Ping lifecycle ----------
 
 func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
@@ -1304,15 +1590,25 @@ func (d *VirtualTun) StartPingIPs() {
 		d.Conf.CheckAliveInterval+2,
 	) * time.Second
 
-	// Размер кэша должен быть не меньше количества адресов для пинга.
+	if ttl <= 0 {
+		ttl = 7 * time.Second
+	}
+
 	cacheSize := d.DnsCacheSize
 
-	if len(d.Conf.CheckAlive) > cacheSize {
+	if cacheSize < len(d.Conf.CheckAlive) {
 		cacheSize = len(d.Conf.CheckAlive)
 	}
 
+	if cacheSize < 1 {
+		cacheSize = 1
+	}
+
 	if d.PingRecord == nil {
-		d.PingRecord = expirable.NewLRU[string, uint64](
+		d.PingRecord = expirable.NewLRU[
+			string,
+			uint64,
+		](
 			cacheSize,
 			nil,
 			ttl,
@@ -1333,36 +1629,47 @@ func (d *VirtualTun) StartPingIPs() {
 	d.pingStop = make(chan struct{})
 
 	d.pingLoopWg.Add(1)
-	go d.runPingLoop()
+
+	stop := d.pingStop
+
+	go d.runPingLoop(stop)
 }
 
-func (d *VirtualTun) runPingLoop() {
+func (d *VirtualTun) runPingLoop(
+	stop <-chan struct{},
+) {
 	defer d.pingLoopWg.Done()
 
 	defer func() {
-		if r := recover(); r != nil {
+		if recovered := recover(); recovered != nil {
 			Log.Error(
 				"Ping loop panicked",
 				"recover",
-				r,
+				recovered,
 			)
+
 			d.stopPingWorkers()
 		}
 	}()
 
 	d.initPingWorkers()
+
 	d.pingIPs()
 
-	ticker := time.NewTicker(
-		time.Duration(
-			d.Conf.CheckAliveInterval,
-		) * time.Second,
-	)
+	interval := time.Duration(
+		d.Conf.CheckAliveInterval,
+	) * time.Second
+
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-d.pingStop:
+		case <-stop:
 			d.stopPingWorkers()
 			return
 
@@ -1376,10 +1683,18 @@ func (d *VirtualTun) StopPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
-	if d.pingStop != nil {
-		close(d.pingStop)
-		d.pingStop = nil
+	stop := d.pingStop
+
+	if stop == nil {
+		return
 	}
 
+	close(stop)
+	d.pingStop = nil
+
+	// pingStopMu удерживается здесь специально:
+	// это не позволяет параллельному StartPingIPs()
+	// создать второй ping loop до полного завершения
+	// предыдущего.
 	d.pingLoopWg.Wait()
 }
