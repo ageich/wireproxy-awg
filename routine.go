@@ -8,9 +8,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path"
 	"runtime"
@@ -27,7 +28,6 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"net/netip"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
@@ -39,9 +39,12 @@ var defaultDialer = &net.Dialer{
 	KeepAlive: 30 * time.Second,
 }
 
+// Оставляем 64 KiB.
+// Pool используется самим SOCKS5 для повторного использования
+// буферов передачи.
 var socksPool = bufferpool.NewPool(64 * 1024)
 
-// Ограничивает только одновременно выполняемые операции:
+// Ограничивает только установление новых TCP-соединений:
 //
 //	resolve DNS + Dial
 //
@@ -52,27 +55,20 @@ var tcpSemaphore = make(
 	runtime.GOMAXPROCS(0)*256,
 )
 
-// ---------- DNS перемешивание ----------
-
-var (
-	dnsRand   = rand.New(rand.NewSource(time.Now().UnixNano()))
-	dnsRandMu sync.Mutex
-)
-
 // ---------- ICMP read buffer pool ----------
 
 var icmpReadPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		b := make([]byte, 1500)
 		return &b
 	},
 }
 
-// ---------- ICMP sequence generator ----------
+// ---------- ICMP sequence ----------
 
 var pingSeq uint32
 
-// ---------- Интерфейсы half-close ----------
+// ---------- Half-close ----------
 
 type closeWriter interface {
 	CloseWrite() error
@@ -91,75 +87,94 @@ var errHalfCloseUnsupported = errors.New(
 type timeoutConn struct {
 	net.Conn
 
-	idle time.Duration
+	idle          time.Duration
+	refreshBefore int64
+	idleNS        int64
 
 	readDeadline  atomic.Int64
 	writeDeadline atomic.Int64
 }
 
-func (c *timeoutConn) refreshReadDeadline(now time.Time) {
-	if c.idle <= 0 {
-		return
-	}
+func newTimeoutConn(
+	conn net.Conn,
+	idle time.Duration,
+) *timeoutConn {
+	idleNS := idle.Nanoseconds()
 
-	nowUnix := now.UnixNano()
-	deadline := c.readDeadline.Load()
-
-	refreshBefore := (c.idle / 10).Nanoseconds()
+	refreshBefore := idleNS / 10
 	if refreshBefore <= 0 {
 		refreshBefore = int64(time.Nanosecond)
 	}
 
-	if deadline != 0 && nowUnix < deadline-refreshBefore {
+	return &timeoutConn{
+		Conn:          conn,
+		idle:          idle,
+		refreshBefore: refreshBefore,
+		idleNS:        idleNS,
+	}
+}
+
+func (c *timeoutConn) refreshReadDeadline(nowUnix int64) {
+	if c.idleNS <= 0 {
 		return
 	}
 
-	newDeadline := now.Add(c.idle)
-	newDeadlineUnix := newDeadline.UnixNano()
+	deadline := c.readDeadline.Load()
+
+	if deadline != 0 &&
+		nowUnix < deadline-c.refreshBefore {
+		return
+	}
+
+	newDeadlineUnix := nowUnix + c.idleNS
 
 	if c.readDeadline.CompareAndSwap(
 		deadline,
 		newDeadlineUnix,
 	) {
-		_ = c.Conn.SetReadDeadline(newDeadline)
+		_ = c.Conn.SetReadDeadline(
+			time.Unix(0, newDeadlineUnix),
+		)
 	}
 }
 
-func (c *timeoutConn) refreshWriteDeadline(now time.Time) {
-	if c.idle <= 0 {
+func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
+	if c.idleNS <= 0 {
 		return
 	}
 
-	nowUnix := now.UnixNano()
 	deadline := c.writeDeadline.Load()
 
-	refreshBefore := (c.idle / 10).Nanoseconds()
-	if refreshBefore <= 0 {
-		refreshBefore = int64(time.Nanosecond)
-	}
-
-	if deadline != 0 && nowUnix < deadline-refreshBefore {
+	if deadline != 0 &&
+		nowUnix < deadline-c.refreshBefore {
 		return
 	}
 
-	newDeadline := now.Add(c.idle)
-	newDeadlineUnix := newDeadline.UnixNano()
+	newDeadlineUnix := nowUnix + c.idleNS
 
 	if c.writeDeadline.CompareAndSwap(
 		deadline,
 		newDeadlineUnix,
 	) {
-		_ = c.Conn.SetWriteDeadline(newDeadline)
+		_ = c.Conn.SetWriteDeadline(
+			time.Unix(0, newDeadlineUnix),
+		)
 	}
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.refreshReadDeadline(time.Now())
+	c.refreshReadDeadline(
+		time.Now().UnixNano(),
+	)
+
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.refreshWriteDeadline(time.Now())
+	c.refreshWriteDeadline(
+		time.Now().UnixNano(),
+	)
+
 	return c.Conn.Write(p)
 }
 
@@ -206,10 +221,10 @@ func dialWithTimeout(
 		return nil, err
 	}
 
-	return &timeoutConn{
-		Conn: conn,
-		idle: IdleTimeout,
-	}, nil
+	return newTimeoutConn(
+		conn,
+		IdleTimeout,
+	), nil
 }
 
 // ---------- timeoutListener ----------
@@ -225,10 +240,10 @@ func (l *timeoutListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &timeoutConn{
-		Conn: conn,
-		idle: l.idle,
-	}, nil
+	return newTimeoutConn(
+		conn,
+		l.idle,
+	), nil
 }
 
 // ---------- CredentialValidator ----------
@@ -282,8 +297,9 @@ type VirtualTun struct {
 }
 
 type pingJob struct {
-	addr        netip.Addr
-	requestPing icmp.Echo
+	addr netip.Addr
+	seq  uint16
+	ts   uint64
 }
 
 // ---------- RoutineSpawner ----------
@@ -297,7 +313,7 @@ type addressPort struct {
 	port    uint16
 }
 
-// ---------- Вспомогательные функции ----------
+// ---------- DNS / address helpers ----------
 
 func (d *VirtualTun) LookupAddr(
 	ctx context.Context,
@@ -346,17 +362,15 @@ func (d *VirtualTun) ResolveAddrWithContext(
 		)
 	}
 
-	dnsRandMu.Lock()
-
-	dnsRand.Shuffle(
-		len(addrs),
-		func(i, j int) {
-			addrs[i], addrs[j] =
-				addrs[j], addrs[i]
-		},
-	)
-
-	dnsRandMu.Unlock()
+	if len(addrs) > 1 {
+		rand.Shuffle(
+			len(addrs),
+			func(i, j int) {
+				addrs[i], addrs[j] =
+					addrs[j], addrs[i]
+			},
+		)
+	}
 
 	var lastErr error
 
@@ -396,7 +410,9 @@ func (d *VirtualTun) Resolve(
 func parseAddressPort(
 	endpoint string,
 ) (*addressPort, error) {
-	name, sport, err := net.SplitHostPort(endpoint)
+	name, sport, err := net.SplitHostPort(
+		endpoint,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +488,6 @@ func dialTCPWithSemaphore(
 		*target,
 	)
 
-	// semaphore освобождается сразу после возврата из Dial.
 	return dialWithTimeout(
 		ctx,
 		"tcp",
@@ -481,7 +496,7 @@ func dialTCPWithSemaphore(
 	)
 }
 
-// ---------- SpawnRoutine implementations ----------
+// ---------- SOCKS5 ----------
 
 func (config *Socks5Config) SpawnRoutine(
 	ctx context.Context,
@@ -539,15 +554,13 @@ func (config *Socks5Config) SpawnRoutine(
 		)
 	}
 
-	options := []socks5.Option{
+	server := socks5.NewServer(
 		socks5.WithDial(dial),
 		socks5.WithResolver(resolver),
 		socks5.WithAuthMethods(authMethods),
 		socks5.WithBufferPool(socksPool),
 		socks5.WithUDPReadTimeout(IdleTimeout),
-	}
-
-	server := socks5.NewServer(options...)
+	)
 
 	for {
 		select {
@@ -584,10 +597,8 @@ func (config *Socks5Config) SpawnRoutine(
 		}
 
 		go func(l net.Listener) {
-			select {
-			case <-ctx.Done():
-				_ = l.Close()
-			}
+			<-ctx.Done()
+			_ = l.Close()
 		}(rawListener)
 
 		Log.Info(
@@ -619,6 +630,8 @@ func (config *Socks5Config) SpawnRoutine(
 		}
 	}
 }
+
+// ---------- HTTP ----------
 
 func (config *HTTPConfig) SpawnRoutine(
 	ctx context.Context,
@@ -660,6 +673,8 @@ func (config *HTTPConfig) SpawnRoutine(
 
 	return nil
 }
+
+// ---------- TCP Client ----------
 
 func (conf *TCPClientTunnelConfig) SpawnRoutine(
 	ctx context.Context,
@@ -737,6 +752,8 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(
 	}
 }
 
+// ---------- STDIO ----------
+
 func (conf *STDIOTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -773,6 +790,8 @@ func (conf *STDIOTunnelConfig) SpawnRoutine(
 	return nil
 }
 
+// ---------- TCP Server ----------
+
 func (conf *TCPServerTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -808,11 +827,11 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(
 		)
 	}
 
-	addr := &net.TCPAddr{
-		Port: conf.ListenPort,
-	}
-
-	server, err := vt.Tnet.ListenTCP(addr)
+	server, err := vt.Tnet.ListenTCP(
+		&net.TCPAddr{
+			Port: conf.ListenPort,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf(
 			"listen on wireguard port %d: %w",
@@ -851,6 +870,8 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(
 		)
 	}
 }
+
+// ---------- UDP ----------
 
 func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 	ctx context.Context,
@@ -951,7 +972,7 @@ func copyBidirectional(
 	wg.Wait()
 }
 
-// ---------- TCP tunnels ----------
+// ---------- TCP forwards ----------
 
 func tcpClientForward(
 	ctx context.Context,
@@ -1051,6 +1072,8 @@ func tcpServerForward(
 	)
 }
 
+// ---------- STDIO forward ----------
+
 func STDIOTcpForward(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -1087,24 +1110,10 @@ func STDIOTcpForward(
 
 	defer sconn.Close()
 
-	stdout, err := os.OpenFile(
-		"/dev/stdout",
-		os.O_WRONLY,
-		0,
-	)
-	if err != nil {
-		Log.Error(
-			"Failed to open /dev/stdout",
-			"error",
-			err,
-		)
-
-		return
-	}
-
-	defer stdout.Close()
+	stdout := os.Stdout
 
 	var wg sync.WaitGroup
+
 	wg.Add(2)
 
 	done := make(chan struct{}, 1)
@@ -1144,17 +1153,15 @@ func STDIOTcpForward(
 	select {
 	case <-ctx.Done():
 		_ = sconn.Close()
-		_ = stdout.Close()
 
 	case <-done:
 		_ = sconn.Close()
-		_ = stdout.Close()
 	}
 
 	wg.Wait()
 }
 
-// ---------- ICMP ping worker pool ----------
+// ---------- ICMP worker pool ----------
 
 func (d *VirtualTun) initPingWorkers() {
 	d.pingMu.Lock()
@@ -1208,10 +1215,15 @@ func (d *VirtualTun) initPingWorkers() {
 				case <-ctx.Done():
 					return
 
-				case job := <-jobs:
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+
 					d.doPing(
 						job.addr,
-						job.requestPing,
+						job.seq,
+						job.ts,
 					)
 				}
 			}
@@ -1250,9 +1262,12 @@ func (d *VirtualTun) stopPingWorkers() {
 	d.pingMu.Unlock()
 }
 
+// ---------- ICMP ----------
+
 func (d *VirtualTun) doPing(
 	addr netip.Addr,
-	requestPing icmp.Echo,
+	seq uint16,
+	ts uint64,
 ) {
 	if d == nil ||
 		d.Tnet == nil ||
@@ -1265,78 +1280,76 @@ func (d *VirtualTun) doPing(
 		addr.String(),
 	)
 	if err != nil {
-		Log.Error(
-			"Failed to ping",
-			"address",
-			addr,
-			"error",
-			err,
-		)
-
 		return
 	}
 
 	defer socket.Close()
 
-	var data [16]byte
+	var packetBuf [24]byte
+	var proto int
 
-	copy(
-		data[:],
-		requestPing.Data,
-	)
-
-	reqPing := icmp.Echo{
-		Seq:  requestPing.Seq,
-		Data: data[:],
-	}
-
-	var (
-		icmpBytes []byte
-		proto     int
-	)
-
-	switch {
-	case addr.Is4():
+	if addr.Is4() {
 		proto = 1
 
-		message := &icmp.Message{
-			Type: ipv4.ICMPTypeEcho,
-			Code: 0,
-			Body: &reqPing,
-		}
+		packetBuf[0] = 8
+		packetBuf[1] = 0
 
-		icmpBytes, err = message.Marshal(nil)
+		binary.BigEndian.PutUint16(
+			packetBuf[4:6],
+			0,
+		)
 
-	case addr.Is6():
+		binary.BigEndian.PutUint16(
+			packetBuf[6:8],
+			seq,
+		)
+
+		binary.BigEndian.PutUint32(
+			packetBuf[8:12],
+			uint32(seq),
+		)
+
+		binary.BigEndian.PutUint64(
+			packetBuf[12:20],
+			ts,
+		)
+
+		cs := checksum(
+			packetBuf[:20],
+		)
+
+		binary.BigEndian.PutUint16(
+			packetBuf[2:4],
+			cs,
+		)
+
+	} else if addr.Is6() {
 		proto = 58
 
-		message := &icmp.Message{
-			Type: ipv6.ICMPTypeEchoRequest,
-			Code: 0,
-			Body: &reqPing,
-		}
+		packetBuf[0] = 128
+		packetBuf[1] = 0
 
-		icmpBytes, err = message.Marshal(nil)
-
-	default:
-		Log.Error(
-			"Failed to ping: invalid address",
-			"address",
-			addr,
+		binary.BigEndian.PutUint16(
+			packetBuf[4:6],
+			0,
 		)
 
-		return
-	}
-
-	if err != nil {
-		Log.Error(
-			"Failed to marshal ping",
-			"address",
-			addr,
-			"error",
-			err,
+		binary.BigEndian.PutUint16(
+			packetBuf[6:8],
+			seq,
 		)
 
+		binary.BigEndian.PutUint32(
+			packetBuf[8:12],
+			uint32(seq),
+		)
+
+		binary.BigEndian.PutUint64(
+			packetBuf[12:20],
+			ts,
+		)
+
+	} else {
 		return
 	}
 
@@ -1352,15 +1365,9 @@ func (d *VirtualTun) doPing(
 		time.Now().Add(timeout),
 	)
 
-	if _, err = socket.Write(icmpBytes); err != nil {
-		Log.Error(
-			"Failed to ping: write error",
-			"address",
-			addr,
-			"error",
-			err,
-		)
-
+	if _, err = socket.Write(
+		packetBuf[:20],
+	); err != nil {
 		return
 	}
 
@@ -1370,19 +1377,9 @@ func (d *VirtualTun) doPing(
 	defer icmpReadPool.Put(bufPtr)
 
 	n, err := socket.Read(readBuf)
-	if err != nil {
-		Log.Error(
-			"Failed to read ping response",
-			"address",
-			addr,
-			"error",
-			err,
-		)
-
-		return
-	}
-
-	if n <= 0 || n > len(readBuf) {
+	if err != nil ||
+		n <= 0 ||
+		n > len(readBuf) {
 		return
 	}
 
@@ -1391,116 +1388,81 @@ func (d *VirtualTun) doPing(
 		readBuf[:n],
 	)
 	if err != nil {
-		Log.Error(
-			"Failed to parse ping response",
-			"address",
-			addr,
-			"error",
-			err,
-		)
-
 		return
 	}
 
 	if addr.Is4() {
 		replyPing, ok := replyPacket.Body.(*icmp.Echo)
 		if !ok {
-			Log.Error(
-				"Failed to parse ping response: invalid reply type",
-				"address",
-				addr,
-				"type",
-				replyPacket.Type,
-			)
-
 			return
 		}
 
-		if !bytes.Equal(
-			replyPing.Data,
-			reqPing.Data,
-		) ||
-			replyPing.Seq != reqPing.Seq {
-			Log.Error(
-				"Failed to parse ping response: invalid ping reply",
-				"address",
-				addr,
-				"reply",
-				replyPing,
-			)
-
+		if replyPing.Seq != int(seq) {
 			return
 		}
 	} else {
 		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
-		if !ok {
-			Log.Error(
-				"Failed to parse ping response: invalid reply type",
-				"address",
-				addr,
-				"type",
-				replyPacket.Type,
-			)
-
+		if !ok || len(replyPing.Data) < 4 {
 			return
 		}
 
-		if len(replyPing.Data) < 4 {
-			Log.Error(
-				"Failed to parse ping response: packet too short",
-				"address",
-				addr,
-			)
-
-			return
-		}
-
-		seq := binary.BigEndian.Uint16(
+		rxSeq := binary.BigEndian.Uint16(
 			replyPing.Data[2:4],
 		)
 
-		pongBody := replyPing.Data[4:]
-
-		if !bytes.Equal(
-			pongBody,
-			reqPing.Data,
-		) ||
-			int(seq) != reqPing.Seq {
-			Log.Error(
-				"Failed to parse ping response: invalid ping reply",
-				"address",
-				addr,
-				"reply",
-				replyPing,
-			)
-
+		if rxSeq != seq {
 			return
 		}
 	}
 
-	if d.PingRecord == nil {
-		return
+	if d.PingRecord != nil {
+		d.PingRecord.Add(
+			addr.String(),
+			uint64(time.Now().Unix()),
+		)
+	}
+}
+
+func checksum(b []byte) uint16 {
+	var sum uint32
+
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(
+			binary.BigEndian.Uint16(
+				b[i : i+2],
+			),
+		)
 	}
 
-	d.PingRecord.Add(
-		addr.String(),
-		uint64(time.Now().Unix()),
-	)
+	if len(b)&1 != 0 {
+		sum += uint32(
+			b[len(b)-1],
+		) << 8
+	}
+
+	for (sum >> 16) != 0 {
+		sum = (sum & 0xffff) +
+			(sum >> 16)
+	}
+
+	return ^uint16(sum)
 }
 
 func (d *VirtualTun) pingIPs() {
-	if d == nil || d.Conf == nil {
+	if d == nil ||
+		d.Conf == nil {
 		return
 	}
 
 	d.pingMu.Lock()
 
-	pingJobs := d.pingJobs
+	jobs := d.pingJobs
 	pingCtx := d.pingCtx
 
 	d.pingMu.Unlock()
 
-	if pingJobs == nil || pingCtx == nil {
+	if jobs == nil ||
+		pingCtx == nil {
 		return
 	}
 
@@ -1511,46 +1473,32 @@ func (d *VirtualTun) pingIPs() {
 	default:
 	}
 
-	seq := atomic.AddUint32(
-		&pingSeq,
-		1,
+	seq := uint16(
+		atomic.AddUint32(
+			&pingSeq,
+			1,
+		),
 	)
 
-	nowUnixNano := uint64(
+	ts := uint64(
 		time.Now().UnixNano(),
 	)
 
 	for _, addr := range d.Conf.CheckAlive {
-		var data [16]byte
-
-		binary.BigEndian.PutUint32(
-			data[:4],
-			seq,
-		)
-
-		binary.BigEndian.PutUint64(
-			data[8:],
-			nowUnixNano,
-		)
-
-		requestPing := icmp.Echo{
-			Seq:  int(seq),
-			Data: data[:],
-		}
-
 		select {
 		case <-pingCtx.Done():
 			return
 
-		case pingJobs <- pingJob{
-			addr:        addr,
-			requestPing: requestPing,
+		case jobs <- pingJob{
+			addr: addr,
+			seq:  seq,
+			ts:   ts,
 		}:
 		}
 	}
 }
 
-// ---------- HTTP health / metrics ----------
+// ---------- HTTP ----------
 
 func (d *VirtualTun) ServeHTTP(
 	w http.ResponseWriter,
@@ -1598,18 +1546,18 @@ func (d *VirtualTun) ServeHTTP(
 
 		if d.Conf != nil {
 			for _, addr := range d.Conf.CheckAlive {
-				key := addr.String()
+				val, okRec := d.PingRecord.Get(
+					addr.String(),
+				)
 
-				val, okRec := d.PingRecord.Get(key)
-
-				if !okRec || val == 0 {
-					ok = false
-					break
-				}
-
-				if now.Sub(
-					time.Unix(int64(val), 0),
-				) > ttl {
+				if !okRec ||
+					val == 0 ||
+					now.Sub(
+						time.Unix(
+							int64(val),
+							0,
+						),
+					) > ttl {
 					ok = false
 					break
 				}
@@ -1617,7 +1565,9 @@ func (d *VirtualTun) ServeHTTP(
 		}
 
 		if ok {
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(
+				http.StatusOK,
+			)
 		} else {
 			w.WriteHeader(
 				http.StatusServiceUnavailable,
@@ -1652,41 +1602,66 @@ func (d *VirtualTun) ServeHTTP(
 
 		var buf bytes.Buffer
 
-		scanner := bufio.NewScanner(
-			strings.NewReader(get),
-		)
+		buf.Grow(len(get))
 
-		for scanner.Scan() {
-			line := scanner.Text()
+		data := []byte(get)
 
-			if line == "" {
+		for len(data) > 0 {
+			idx := bytes.IndexByte(
+				data,
+				'\n',
+			)
+
+			var line []byte
+
+			if idx >= 0 {
+				line = data[:idx]
+				data = data[idx+1:]
+			} else {
+				line = data
+				data = nil
+			}
+
+			if len(line) == 0 {
 				continue
 			}
 
-			pair := strings.SplitN(
+			eqIdx := bytes.IndexByte(
 				line,
-				"=",
-				2,
+				'=',
 			)
 
-			if len(pair) != 2 {
-				buf.WriteString(line)
+			if eqIdx < 0 {
+				buf.Write(line)
 				buf.WriteByte('\n')
 				continue
 			}
 
-			if pair[0] == "private_key" ||
-				pair[0] == "preshared_key" {
-				pair[1] = "REDACTED"
+			key := line[:eqIdx]
+
+			if bytes.Equal(
+				key,
+				[]byte("private_key"),
+			) ||
+				bytes.Equal(
+					key,
+					[]byte("preshared_key"),
+				) {
+				buf.Write(key)
+				buf.WriteString(
+					"=REDACTED\n",
+				)
+
+				continue
 			}
 
-			buf.WriteString(pair[0])
-			buf.WriteByte('=')
-			buf.WriteString(pair[1])
+			buf.Write(line)
 			buf.WriteByte('\n')
 		}
 
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(
+			http.StatusOK,
+		)
 
 		_, _ = w.Write(
 			buf.Bytes(),
@@ -1711,11 +1686,8 @@ func (d *VirtualTun) StartPingIPs() {
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
-	if d.pingStop != nil {
-		return
-	}
-
-	if d.Conf == nil {
+	if d.pingStop != nil ||
+		d.Conf == nil {
 		return
 	}
 
@@ -1729,8 +1701,12 @@ func (d *VirtualTun) StartPingIPs() {
 
 	cacheSize := d.DnsCacheSize
 
-	if cacheSize < len(d.Conf.CheckAlive) {
-		cacheSize = len(d.Conf.CheckAlive)
+	if cacheSize < len(
+		d.Conf.CheckAlive,
+	) {
+		cacheSize = len(
+			d.Conf.CheckAlive,
+		)
 	}
 
 	if cacheSize < 1 {
@@ -1749,11 +1725,11 @@ func (d *VirtualTun) StartPingIPs() {
 	}
 
 	for _, addr := range d.Conf.CheckAlive {
-		if _, ok := d.PingRecord.Get(
-			addr.String(),
-		); !ok {
+		key := addr.String()
+
+		if _, ok := d.PingRecord.Get(key); !ok {
 			d.PingRecord.Add(
-				addr.String(),
+				key,
 				0,
 			)
 		}
@@ -1781,17 +1757,13 @@ func (d *VirtualTun) runPingLoop(
 				recovered,
 			)
 
-			// ВАЖНО:
-			// здесь нельзя брать pingStopMu.
-			//
-			// StopPingIPs() может уже держать этот mutex
-			// и ждать завершения pingLoopWg.
+			// Не брать pingStopMu здесь:
+			// StopPingIPs может держать его во время Wait().
 			d.stopPingWorkers()
 		}
 	}()
 
 	d.initPingWorkers()
-
 	d.pingIPs()
 
 	interval := 5 * time.Second
@@ -1824,6 +1796,7 @@ func (d *VirtualTun) StopPingIPs() {
 	defer d.pingStopMu.Unlock()
 
 	stop := d.pingStop
+
 	if stop == nil {
 		return
 	}
@@ -1831,9 +1804,7 @@ func (d *VirtualTun) StopPingIPs() {
 	close(stop)
 	d.pingStop = nil
 
-	// Ждём завершения ping loop.
-	//
-	// ping loop НЕ пытается взять pingStopMu во время
-	// shutdown, поэтому deadlock здесь отсутствует.
+	// runPingLoop не берет pingStopMu,
+	// поэтому Wait безопасен.
 	d.pingLoopWg.Wait()
 }
