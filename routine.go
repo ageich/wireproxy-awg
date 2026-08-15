@@ -88,13 +88,6 @@ var errHalfCloseUnsupported = errors.New(
 
 // ---------- timeoutConn ----------
 
-// timeoutConn обновляет idle deadline только при необходимости.
-//
-// Внутри atomic.Int64 хранится deadline в UnixNano.
-//
-// Важно:
-// time.Duration нельзя напрямую вычитать из int64,
-// поэтому перед сравнением duration преобразуется через Nanoseconds().
 type timeoutConn struct {
 	net.Conn
 
@@ -104,10 +97,12 @@ type timeoutConn struct {
 	writeDeadline atomic.Int64
 }
 
-func (c *timeoutConn) Read(p []byte) (int, error) {
-	now := time.Now()
-	nowUnix := now.UnixNano()
+func (c *timeoutConn) refreshReadDeadline(now time.Time) {
+	if c.idle <= 0 {
+		return
+	}
 
+	nowUnix := now.UnixNano()
 	deadline := c.readDeadline.Load()
 
 	refreshBefore := (c.idle / 10).Nanoseconds()
@@ -115,25 +110,27 @@ func (c *timeoutConn) Read(p []byte) (int, error) {
 		refreshBefore = int64(time.Nanosecond)
 	}
 
-	if deadline == 0 || nowUnix >= deadline-refreshBefore {
-		newDeadline := now.Add(c.idle)
-		newDeadlineUnix := newDeadline.UnixNano()
-
-		if c.readDeadline.CompareAndSwap(
-			deadline,
-			newDeadlineUnix,
-		) {
-			_ = c.Conn.SetReadDeadline(newDeadline)
-		}
+	if deadline != 0 && nowUnix < deadline-refreshBefore {
+		return
 	}
 
-	return c.Conn.Read(p)
+	newDeadline := now.Add(c.idle)
+	newDeadlineUnix := newDeadline.UnixNano()
+
+	if c.readDeadline.CompareAndSwap(
+		deadline,
+		newDeadlineUnix,
+	) {
+		_ = c.Conn.SetReadDeadline(newDeadline)
+	}
 }
 
-func (c *timeoutConn) Write(p []byte) (int, error) {
-	now := time.Now()
-	nowUnix := now.UnixNano()
+func (c *timeoutConn) refreshWriteDeadline(now time.Time) {
+	if c.idle <= 0 {
+		return
+	}
 
+	nowUnix := now.UnixNano()
 	deadline := c.writeDeadline.Load()
 
 	refreshBefore := (c.idle / 10).Nanoseconds()
@@ -141,18 +138,28 @@ func (c *timeoutConn) Write(p []byte) (int, error) {
 		refreshBefore = int64(time.Nanosecond)
 	}
 
-	if deadline == 0 || nowUnix >= deadline-refreshBefore {
-		newDeadline := now.Add(c.idle)
-		newDeadlineUnix := newDeadline.UnixNano()
-
-		if c.writeDeadline.CompareAndSwap(
-			deadline,
-			newDeadlineUnix,
-		) {
-			_ = c.Conn.SetWriteDeadline(newDeadline)
-		}
+	if deadline != 0 && nowUnix < deadline-refreshBefore {
+		return
 	}
 
+	newDeadline := now.Add(c.idle)
+	newDeadlineUnix := newDeadline.UnixNano()
+
+	if c.writeDeadline.CompareAndSwap(
+		deadline,
+		newDeadlineUnix,
+	) {
+		_ = c.Conn.SetWriteDeadline(newDeadline)
+	}
+}
+
+func (c *timeoutConn) Read(p []byte) (int, error) {
+	c.refreshReadDeadline(time.Now())
+	return c.Conn.Read(p)
+}
+
+func (c *timeoutConn) Write(p []byte) (int, error) {
+	c.refreshWriteDeadline(time.Now())
 	return c.Conn.Write(p)
 }
 
@@ -160,10 +167,6 @@ func (c *timeoutConn) Close() error {
 	return c.Conn.Close()
 }
 
-// CloseWrite сохраняет TCP half-close.
-//
-// Если underlying connection поддерживает CloseWrite,
-// используется он. Иначе возвращается ошибка.
 func (c *timeoutConn) CloseWrite() error {
 	if cw, ok := c.Conn.(closeWriter); ok {
 		return cw.CloseWrite()
@@ -172,10 +175,6 @@ func (c *timeoutConn) CloseWrite() error {
 	return errHalfCloseUnsupported
 }
 
-// CloseRead сохраняет TCP half-close.
-//
-// Если underlying connection поддерживает CloseRead,
-// используется он. Иначе возвращается ошибка.
 func (c *timeoutConn) CloseRead() error {
 	if cr, ok := c.Conn.(closeReader); ok {
 		return cr.CloseRead()
@@ -186,14 +185,18 @@ func (c *timeoutConn) CloseRead() error {
 
 // ---------- Dial ----------
 
-// dialWithTimeout создаёт соединение через vt.Tnet.DialContext
-// и оборачивает его в timeoutConn.
 func dialWithTimeout(
 	ctx context.Context,
 	network string,
 	addr string,
 	vt *VirtualTun,
 ) (net.Conn, error) {
+	if vt == nil || vt.Tnet == nil {
+		return nil, errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	conn, err := vt.Tnet.DialContext(
 		ctx,
 		network,
@@ -270,7 +273,6 @@ type VirtualTun struct {
 	UdpSessionCacheSize int
 	DnsTtl              time.Duration
 
-	// Ping worker pool.
 	pingMu             sync.Mutex
 	pingJobs           chan pingJob
 	pingWorkers        sync.WaitGroup
@@ -301,10 +303,22 @@ func (d *VirtualTun) LookupAddr(
 	ctx context.Context,
 	name string,
 ) ([]string, error) {
+	if d == nil {
+		return nil, errors.New(
+			"virtual tun is nil",
+		)
+	}
+
 	if d.SystemDNS {
 		return net.DefaultResolver.LookupHost(
 			ctx,
 			name,
+		)
+	}
+
+	if d.Tnet == nil {
+		return nil, errors.New(
+			"network stack is nil",
 		)
 	}
 
@@ -318,13 +332,15 @@ func (d *VirtualTun) ResolveAddrWithContext(
 	ctx context.Context,
 	name string,
 ) (*netip.Addr, error) {
-	addrs, err := d.LookupAddr(ctx, name)
+	addrs, err := d.LookupAddr(
+		ctx,
+		name,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	size := len(addrs)
-	if size == 0 {
+	if len(addrs) == 0 {
 		return nil, errors.New(
 			"no address found for: " + name,
 		)
@@ -333,7 +349,7 @@ func (d *VirtualTun) ResolveAddrWithContext(
 	dnsRandMu.Lock()
 
 	dnsRand.Shuffle(
-		size,
+		len(addrs),
 		func(i, j int) {
 			addrs[i], addrs[j] =
 				addrs[j], addrs[i]
@@ -342,20 +358,24 @@ func (d *VirtualTun) ResolveAddrWithContext(
 
 	dnsRandMu.Unlock()
 
-	var addr netip.Addr
+	var lastErr error
 
 	for _, saddr := range addrs {
-		addr, err = netip.ParseAddr(saddr)
+		addr, err := netip.ParseAddr(saddr)
 		if err == nil {
-			break
+			return &addr, nil
 		}
+
+		lastErr = err
 	}
 
-	if err != nil {
-		return nil, err
+	if lastErr == nil {
+		lastErr = errors.New(
+			"invalid DNS result",
+		)
 	}
 
-	return &addr, nil
+	return nil, lastErr
 }
 
 func (d *VirtualTun) Resolve(
@@ -401,6 +421,12 @@ func (d *VirtualTun) resolveToAddrPort(
 	ctx context.Context,
 	endpoint *addressPort,
 ) (*netip.AddrPort, error) {
+	if endpoint == nil {
+		return nil, errors.New(
+			"endpoint is nil",
+		)
+	}
+
 	addr, err := d.ResolveAddrWithContext(
 		ctx,
 		endpoint.address,
@@ -419,18 +445,6 @@ func (d *VirtualTun) resolveToAddrPort(
 
 // ---------- TCP Dial + semaphore ----------
 
-// Ограничивает только установление исходящего TCP-соединения:
-//
-//	Acquire
-//	    |
-//	    +-- DNS resolve
-//	    |
-//	    +-- Tnet.DialContext
-//	    |
-//	Release
-//
-// После Release TCP-соединение может жить часами,
-// не занимая semaphore.
 func dialTCPWithSemaphore(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -458,6 +472,7 @@ func dialTCPWithSemaphore(
 		*target,
 	)
 
+	// semaphore освобождается сразу после возврата из Dial.
 	return dialWithTimeout(
 		ctx,
 		"tcp",
@@ -472,6 +487,18 @@ func (config *Socks5Config) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if config == nil {
+		return errors.New(
+			"SOCKS5 config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	resolver := NewFixedResolver(
 		vt.Tnet,
 		vt.SystemDNS,
@@ -557,8 +584,10 @@ func (config *Socks5Config) SpawnRoutine(
 		}
 
 		go func(l net.Listener) {
-			<-ctx.Done()
-			_ = l.Close()
+			select {
+			case <-ctx.Done():
+				_ = l.Close()
+			}
 		}(rawListener)
 
 		Log.Info(
@@ -595,6 +624,18 @@ func (config *HTTPConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if config == nil {
+		return errors.New(
+			"HTTP config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	server := NewHTTPServer(
 		config,
 		vt.Tnet.Dial,
@@ -620,12 +661,22 @@ func (config *HTTPConfig) SpawnRoutine(
 	return nil
 }
 
-// TCPClientTunnelConfig.BindAddress имеет тип *net.TCPAddr.
-// Поэтому используется net.ListenTCP().
 func (conf *TCPClientTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if conf == nil {
+		return errors.New(
+			"TCP client config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	raddr, err := parseAddressPort(
 		conf.Target,
 	)
@@ -690,6 +741,18 @@ func (conf *STDIOTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if conf == nil {
+		return errors.New(
+			"STDIO config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	raddr, err := parseAddressPort(
 		conf.Target,
 	)
@@ -714,6 +777,18 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if conf == nil {
+		return errors.New(
+			"TCP server config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	raddr, err := parseAddressPort(
 		conf.Target,
 	)
@@ -722,6 +797,14 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(
 			"parse target %s: %w",
 			conf.Target,
 			err,
+		)
+	}
+
+	if conf.ListenPort < 0 ||
+		conf.ListenPort > 65535 {
+		return fmt.Errorf(
+			"invalid listen port: %d",
+			conf.ListenPort,
 		)
 	}
 
@@ -773,6 +856,18 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 	ctx context.Context,
 	vt *VirtualTun,
 ) error {
+	if conf == nil {
+		return errors.New(
+			"UDP proxy config is nil",
+		)
+	}
+
+	if vt == nil || vt.Tnet == nil {
+		return errors.New(
+			"virtual tun is not initialized",
+		)
+	}
+
 	return conf.SpawnUDPProxy(
 		ctx,
 		vt,
@@ -782,6 +877,10 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 // ---------- Bidirectional copy ----------
 
 func closeWriteOrClose(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+
 	if cw, ok := conn.(closeWriter); ok {
 		if err := cw.CloseWrite(); err == nil {
 			return
@@ -792,6 +891,10 @@ func closeWriteOrClose(conn net.Conn) {
 }
 
 func closeReadOrClose(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+
 	if cr, ok := conn.(closeReader); ok {
 		if err := cr.CloseRead(); err == nil {
 			return
@@ -801,23 +904,22 @@ func closeReadOrClose(conn net.Conn) {
 	_ = conn.Close()
 }
 
-// copyBidirectional выполняет full-duplex copy.
-//
-// При EOF:
-//
-//	a -> b:
-//	    CloseWrite(b)
-//	    CloseRead(a)
-//
-//	b -> a:
-//	    CloseWrite(a)
-//	    CloseRead(b)
-//
-// Это позволяет сохранять TCP half-close.
 func copyBidirectional(
 	a,
 	b net.Conn,
 ) {
+	if a == nil || b == nil {
+		if a != nil {
+			_ = a.Close()
+		}
+
+		if b != nil {
+			_ = b.Close()
+		}
+
+		return
+	}
+
 	var wg sync.WaitGroup
 
 	wg.Add(2)
@@ -867,6 +969,10 @@ func tcpClientForward(
 		}
 	}()
 
+	if conn == nil {
+		return
+	}
+
 	defer conn.Close()
 
 	sconn, err := dialTCPWithSemaphore(
@@ -890,7 +996,6 @@ func tcpClientForward(
 
 	defer sconn.Close()
 
-	// semaphore уже освобождён.
 	copyBidirectional(
 		conn,
 		sconn,
@@ -912,6 +1017,10 @@ func tcpServerForward(
 			)
 		}
 	}()
+
+	if conn == nil {
+		return
+	}
 
 	defer conn.Close()
 
@@ -1075,47 +1184,41 @@ func (d *VirtualTun) initPingWorkers() {
 		queueSize = 256
 	}
 
-	d.pingCtx = pingCtx
-	d.pingCancel = cancel
-
-	d.pingJobs = make(
+	jobs := make(
 		chan pingJob,
 		queueSize,
 	)
 
+	d.pingCtx = pingCtx
+	d.pingCancel = cancel
+	d.pingJobs = jobs
+	d.pingWorkersStarted = true
+
 	for i := 0; i < workers; i++ {
 		d.pingWorkers.Add(1)
-		go d.pingWorker()
-	}
 
-	d.pingWorkersStarted = true
-}
+		go func(
+			jobs <-chan pingJob,
+			ctx context.Context,
+		) {
+			defer d.pingWorkers.Done()
 
-func (d *VirtualTun) pingWorker() {
-	defer d.pingWorkers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
 
-	d.pingMu.Lock()
-
-	jobs := d.pingJobs
-	ctx := d.pingCtx
-
-	d.pingMu.Unlock()
-
-	if jobs == nil || ctx == nil {
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case job := <-jobs:
-			d.doPing(
-				job.addr,
-				job.requestPing,
-			)
-		}
+				case job := <-jobs:
+					d.doPing(
+						job.addr,
+						job.requestPing,
+					)
+				}
+			}
+		}(
+			jobs,
+			pingCtx,
+		)
 	}
 }
 
@@ -1151,7 +1254,9 @@ func (d *VirtualTun) doPing(
 	addr netip.Addr,
 	requestPing icmp.Echo,
 ) {
-	if d.Tnet == nil {
+	if d == nil ||
+		d.Tnet == nil ||
+		d.Conf == nil {
 		return
 	}
 
@@ -1190,7 +1295,8 @@ func (d *VirtualTun) doPing(
 		proto     int
 	)
 
-	if addr.Is4() {
+	switch {
+	case addr.Is4():
 		proto = 1
 
 		message := &icmp.Message{
@@ -1200,7 +1306,8 @@ func (d *VirtualTun) doPing(
 		}
 
 		icmpBytes, err = message.Marshal(nil)
-	} else if addr.Is6() {
+
+	case addr.Is6():
 		proto = 58
 
 		message := &icmp.Message{
@@ -1210,7 +1317,8 @@ func (d *VirtualTun) doPing(
 		}
 
 		icmpBytes, err = message.Marshal(nil)
-	} else {
+
+	default:
 		Log.Error(
 			"Failed to ping: invalid address",
 			"address",
@@ -1311,7 +1419,8 @@ func (d *VirtualTun) doPing(
 		if !bytes.Equal(
 			replyPing.Data,
 			reqPing.Data,
-		) || replyPing.Seq != reqPing.Seq {
+		) ||
+			replyPing.Seq != reqPing.Seq {
 			Log.Error(
 				"Failed to parse ping response: invalid ping reply",
 				"address",
@@ -1355,7 +1464,8 @@ func (d *VirtualTun) doPing(
 		if !bytes.Equal(
 			pongBody,
 			reqPing.Data,
-		) || int(seq) != reqPing.Seq {
+		) ||
+			int(seq) != reqPing.Seq {
 			Log.Error(
 				"Failed to parse ping response: invalid ping reply",
 				"address",
@@ -1379,6 +1489,10 @@ func (d *VirtualTun) doPing(
 }
 
 func (d *VirtualTun) pingIPs() {
+	if d == nil || d.Conf == nil {
+		return
+	}
+
 	d.pingMu.Lock()
 
 	pingJobs := d.pingJobs
@@ -1425,13 +1539,13 @@ func (d *VirtualTun) pingIPs() {
 		}
 
 		select {
+		case <-pingCtx.Done():
+			return
+
 		case pingJobs <- pingJob{
 			addr:        addr,
 			requestPing: requestPing,
 		}:
-
-		case <-pingCtx.Done():
-			return
 		}
 	}
 }
@@ -1468,33 +1582,37 @@ func (d *VirtualTun) ServeHTTP(
 
 		now := time.Now()
 
-		interval := time.Duration(
-			d.Conf.CheckAliveInterval,
-		) * time.Second
+		interval := 5 * time.Second
 
-		if interval <= 0 {
-			interval = 5 * time.Second
+		if d.Conf != nil &&
+			d.Conf.CheckAliveInterval > 0 {
+			interval =
+				time.Duration(
+					d.Conf.CheckAliveInterval,
+				) * time.Second
 		}
 
 		ttl := interval + 2*time.Second
 
 		ok := true
 
-		for _, addr := range d.Conf.CheckAlive {
-			key := addr.String()
+		if d.Conf != nil {
+			for _, addr := range d.Conf.CheckAlive {
+				key := addr.String()
 
-			val, okRec := d.PingRecord.Get(key)
+				val, okRec := d.PingRecord.Get(key)
 
-			if !okRec || val == 0 {
-				ok = false
-				break
-			}
+				if !okRec || val == 0 {
+					ok = false
+					break
+				}
 
-			if now.Sub(
-				time.Unix(int64(val), 0),
-			) > ttl {
-				ok = false
-				break
+				if now.Sub(
+					time.Unix(int64(val), 0),
+				) > ttl {
+					ok = false
+					break
+				}
 			}
 		}
 
@@ -1597,6 +1715,10 @@ func (d *VirtualTun) StartPingIPs() {
 		return
 	}
 
+	if d.Conf == nil {
+		return
+	}
+
 	ttl := time.Duration(
 		d.Conf.CheckAliveInterval+2,
 	) * time.Second
@@ -1637,11 +1759,11 @@ func (d *VirtualTun) StartPingIPs() {
 		}
 	}
 
-	d.pingStop = make(chan struct{})
+	stop := make(chan struct{})
+
+	d.pingStop = stop
 
 	d.pingLoopWg.Add(1)
-
-	stop := d.pingStop
 
 	go d.runPingLoop(stop)
 }
@@ -1659,6 +1781,11 @@ func (d *VirtualTun) runPingLoop(
 				recovered,
 			)
 
+			// ВАЖНО:
+			// здесь нельзя брать pingStopMu.
+			//
+			// StopPingIPs() может уже держать этот mutex
+			// и ждать завершения pingLoopWg.
 			d.stopPingWorkers()
 		}
 	}()
@@ -1667,12 +1794,14 @@ func (d *VirtualTun) runPingLoop(
 
 	d.pingIPs()
 
-	interval := time.Duration(
-		d.Conf.CheckAliveInterval,
-	) * time.Second
+	interval := 5 * time.Second
 
-	if interval <= 0 {
-		interval = 5 * time.Second
+	if d.Conf != nil &&
+		d.Conf.CheckAliveInterval > 0 {
+		interval =
+			time.Duration(
+				d.Conf.CheckAliveInterval,
+			) * time.Second
 	}
 
 	ticker := time.NewTicker(interval)
@@ -1695,7 +1824,6 @@ func (d *VirtualTun) StopPingIPs() {
 	defer d.pingStopMu.Unlock()
 
 	stop := d.pingStop
-
 	if stop == nil {
 		return
 	}
@@ -1703,7 +1831,9 @@ func (d *VirtualTun) StopPingIPs() {
 	close(stop)
 	d.pingStop = nil
 
-	// Не разрешаем StartPingIPs() запустить новый
-	// ping loop до полного завершения старого.
+	// Ждём завершения ping loop.
+	//
+	// ping loop НЕ пытается взять pingStopMu во время
+	// shutdown, поэтому deadlock здесь отсутствует.
 	d.pingLoopWg.Wait()
 }
