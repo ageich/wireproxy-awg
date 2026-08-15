@@ -1,7 +1,6 @@
 package wireproxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -16,7 +15,6 @@ import (
 	"path"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,8 +24,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
@@ -46,7 +42,7 @@ var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Ограничивает только установление новых TCP-соединений:
 //
-//	resolve DNS + Dial
+// resolve DNS + Dial
 //
 // После успешного Dial semaphore освобождается.
 // Длительные TCP-соединения semaphore НЕ занимают.
