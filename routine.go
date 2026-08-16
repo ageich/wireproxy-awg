@@ -42,11 +42,15 @@ var socksPool = bufferpool.NewPool(64 * 1024)
 //
 //	DNS resolve + TCP Dial
 //
-// Once Dial succeeds the semaphore is released.
-// Long-lived TCP connections do NOT occupy semaphore slots.
+// IMPORTANT:
+// The semaphore is released immediately after Dial succeeds.
+// Long-lived TCP connections do NOT consume semaphore slots.
+//
+// A larger limit improves burst connection establishment without
+// affecting established TCP throughput.
 var tcpSemaphore = make(
 	chan struct{},
-	runtime.GOMAXPROCS(0)*256,
+	max(512, runtime.GOMAXPROCS(0)*512),
 )
 
 // ---------- ICMP read buffer pool ----------
@@ -78,16 +82,17 @@ var errHalfCloseUnsupported = errors.New(
 
 // ---------- timeoutConn ----------
 
-// timeoutConn refreshes idle read/write deadlines only when necessary.
+// timeoutConn maintains an idle timeout without changing deadlines
+// on every packet.
 //
-// Deadlines are stored atomically so Read and Write don't need to take
-// a mutex on every operation.
+// The important optimization here is that SetReadDeadline/SetWriteDeadline
+// are relatively expensive operations. We therefore refresh only when the
+// current deadline is close to expiration.
 //
-// A deadline is refreshed when less than 10% of idle timeout remains.
+// Atomic deadlines allow concurrent Read/Write without a mutex.
 type timeoutConn struct {
 	net.Conn
 
-	idle          time.Duration
 	idleNS        int64
 	refreshBefore int64
 
@@ -99,41 +104,48 @@ func newTimeoutConn(
 	conn net.Conn,
 	idle time.Duration,
 ) *timeoutConn {
+	if conn == nil {
+		return nil
+	}
+
 	if idle <= 0 {
 		return &timeoutConn{
 			Conn: conn,
-			idle: 0,
 		}
 	}
 
 	idleNS := idle.Nanoseconds()
 
+	// Refresh only during the final 10% of the idle interval.
 	refreshBefore := idleNS / 10
-	if refreshBefore < int64(time.Nanosecond) {
-		refreshBefore = int64(time.Nanosecond)
+
+	if refreshBefore < int64(time.Millisecond) {
+		refreshBefore = int64(time.Millisecond)
 	}
 
 	return &timeoutConn{
 		Conn:          conn,
-		idle:          idle,
 		idleNS:        idleNS,
 		refreshBefore: refreshBefore,
 	}
 }
 
-func (c *timeoutConn) refreshReadDeadline(nowUnix int64) {
-	if c.idleNS <= 0 {
+func (c *timeoutConn) refreshReadDeadline(now int64) {
+	idleNS := c.idleNS
+
+	if idleNS <= 0 {
 		return
 	}
 
 	deadline := c.readDeadline.Load()
 
+	// Fast path: deadline still has plenty of time.
 	if deadline != 0 &&
-		nowUnix < deadline-c.refreshBefore {
+		now < deadline-c.refreshBefore {
 		return
 	}
 
-	newDeadline := nowUnix + c.idleNS
+	newDeadline := now + idleNS
 
 	if c.readDeadline.CompareAndSwap(
 		deadline,
@@ -145,19 +157,22 @@ func (c *timeoutConn) refreshReadDeadline(nowUnix int64) {
 	}
 }
 
-func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
-	if c.idleNS <= 0 {
+func (c *timeoutConn) refreshWriteDeadline(now int64) {
+	idleNS := c.idleNS
+
+	if idleNS <= 0 {
 		return
 	}
 
 	deadline := c.writeDeadline.Load()
 
+	// Fast path: deadline still has plenty of time.
 	if deadline != 0 &&
-		nowUnix < deadline-c.refreshBefore {
+		now < deadline-c.refreshBefore {
 		return
 	}
 
-	newDeadline := nowUnix + c.idleNS
+	newDeadline := now + idleNS
 
 	if c.writeDeadline.CompareAndSwap(
 		deadline,
@@ -170,17 +185,17 @@ func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.refreshReadDeadline(
-		time.Now().UnixNano(),
-	)
+	if c.idleNS > 0 {
+		c.refreshReadDeadline(time.Now().UnixNano())
+	}
 
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.refreshWriteDeadline(
-		time.Now().UnixNano(),
-	)
+	if c.idleNS > 0 {
+		c.refreshWriteDeadline(time.Now().UnixNano())
+	}
 
 	return c.Conn.Write(p)
 }
@@ -228,6 +243,10 @@ func dialWithTimeout(
 		return nil, err
 	}
 
+	if IdleTimeout <= 0 {
+		return conn, nil
+	}
+
 	return newTimeoutConn(
 		conn,
 		IdleTimeout,
@@ -245,6 +264,10 @@ func (l *timeoutListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
+	}
+
+	if l.idle <= 0 {
+		return conn, nil
 	}
 
 	return newTimeoutConn(
@@ -376,8 +399,6 @@ func (d *VirtualTun) ResolveAddrWithContext(
 		)
 	}
 
-	// math/rand/v2 top-level functions are safe for concurrent use.
-	// No package-level mutex is required.
 	if len(addrs) > 1 {
 		rand.Shuffle(
 			len(addrs),
@@ -392,6 +413,7 @@ func (d *VirtualTun) ResolveAddrWithContext(
 
 	for _, saddr := range addrs {
 		addr, parseErr := netip.ParseAddr(saddr)
+
 		if parseErr == nil {
 			return &addr, nil
 		}
@@ -483,11 +505,15 @@ func (d *VirtualTun) resolveToAddrPort(
 
 // ---------- TCP Dial + semaphore ----------
 
-// dialTCPWithSemaphore limits only:
+// dialTCPWithSemaphore limits only the expensive establishment phase:
 //
 //	resolve + Dial
 //
-// It deliberately releases the semaphore before returning the connection.
+// The semaphore is ALWAYS released before the established connection
+// is returned to the caller.
+//
+// Therefore upload/download throughput of established connections is
+// completely independent of tcpSemaphore.
 func dialTCPWithSemaphore(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -513,10 +539,6 @@ func dialTCPWithSemaphore(
 
 	select {
 	case tcpSemaphore <- struct{}{}:
-		defer func() {
-			<-tcpSemaphore
-		}()
-
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -525,7 +547,9 @@ func dialTCPWithSemaphore(
 		ctx,
 		raddr,
 	)
+
 	if err != nil {
+		<-tcpSemaphore
 		return nil, err
 	}
 
@@ -533,12 +557,20 @@ func dialTCPWithSemaphore(
 		*target,
 	)
 
-	return dialWithTimeout(
+	conn, err := dialWithTimeout(
 		ctx,
 		"tcp",
 		tcpAddr.String(),
 		vt,
 	)
+
+	// RELEASE BEFORE RETURNING THE CONNECTION.
+	//
+	// This is critical for high-throughput workloads with many
+	// long-lived TCP connections.
+	<-tcpSemaphore
+
+	return conn, err
 }
 
 // ---------- SOCKS5 ----------
@@ -619,6 +651,7 @@ func (config *Socks5Config) SpawnRoutine(
 			"tcp",
 			config.BindAddress,
 		)
+
 		if err != nil {
 			Log.Error(
 				"Failed to listen",
@@ -799,6 +832,7 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(
 
 	for {
 		conn, err := server.Accept()
+
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -918,6 +952,7 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(
 
 	for {
 		conn, err := server.Accept()
+
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -967,9 +1002,17 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 // ---------- Bidirectional copy ----------
 
 // halfCloseWrite closes only the write side.
-// The direction is:
 //
-//	src -> dst  => CloseWrite(dst)
+// Direction:
+//
+//	src -> dst
+//
+// after src reaches EOF:
+//
+//	CloseWrite(dst)
+//
+// This is intentionally preserved because removing half-close can break
+// protocols that use EOF as a meaningful signal.
 func halfCloseWrite(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -1011,7 +1054,7 @@ func copyBidirectional(
 			a,
 		)
 
-		// EOF from b means that a's write direction must be closed.
+		// EOF from b means that a's write side must be closed.
 		_ = halfCloseWrite(a)
 	}()
 
@@ -1024,13 +1067,13 @@ func copyBidirectional(
 			b,
 		)
 
-		// EOF from a means that b's write direction must be closed.
+		// EOF from a means that b's write side must be closed.
 		_ = halfCloseWrite(b)
 	}()
 
 	wg.Wait()
 
-	// Both directions have completed.
+	// Both directions completed.
 	_ = a.Close()
 	_ = b.Close()
 }
@@ -1057,14 +1100,14 @@ func tcpClientForward(
 		return
 	}
 
-	defer conn.Close()
-
 	sconn, err := dialTCPWithSemaphore(
 		ctx,
 		vt,
 		raddr,
 	)
 	if err != nil {
+		_ = conn.Close()
+
 		if ctx.Err() == nil {
 			Log.Error(
 				"TCP Client Tunnel dial error",
@@ -1079,8 +1122,6 @@ func tcpClientForward(
 
 		return
 	}
-
-	defer sconn.Close()
 
 	copyBidirectional(
 		conn,
@@ -1108,14 +1149,14 @@ func tcpServerForward(
 		return
 	}
 
-	defer conn.Close()
-
 	sconn, err := dialTCPWithSemaphore(
 		ctx,
 		vt,
 		raddr,
 	)
 	if err != nil {
+		_ = conn.Close()
+
 		if ctx.Err() == nil {
 			Log.Error(
 				"TCP Server Tunnel dial error",
@@ -1130,8 +1171,6 @@ func tcpServerForward(
 
 		return
 	}
-
-	defer sconn.Close()
 
 	copyBidirectional(
 		conn,
@@ -1247,15 +1286,18 @@ func (d *VirtualTun) initPingWorkers() {
 		workers = 2
 	}
 
-	// Avoid creating an excessively large queue.
-	queueSize := workers * 8
+	// ICMP is low priority compared with TCP forwarding.
+	//
+	// Keep a bounded queue to avoid turning a burst of checks into
+	// unbounded memory consumption.
+	queueSize := workers * 16
 
-	if queueSize < 16 {
-		queueSize = 16
+	if queueSize < 32 {
+		queueSize = 32
 	}
 
-	if queueSize > 256 {
-		queueSize = 256
+	if queueSize > 512 {
+		queueSize = 512
 	}
 
 	jobs := make(
@@ -1363,29 +1405,24 @@ func (d *VirtualTun) doPing(
 	case addr.Is4():
 		proto = 1
 
-		// ICMP Echo Request.
 		packetBuf[0] = 8
 		packetBuf[1] = 0
 
-		// Identifier.
 		binary.BigEndian.PutUint16(
 			packetBuf[4:6],
 			0,
 		)
 
-		// Sequence.
 		binary.BigEndian.PutUint16(
 			packetBuf[6:8],
 			seq,
 		)
 
-		// Payload sequence.
 		binary.BigEndian.PutUint32(
 			packetBuf[8:12],
 			uint32(seq),
 		)
 
-		// Timestamp.
 		binary.BigEndian.PutUint64(
 			packetBuf[12:20],
 			ts,
@@ -1399,29 +1436,24 @@ func (d *VirtualTun) doPing(
 	case addr.Is6():
 		proto = 58
 
-		// ICMPv6 Echo Request.
 		packetBuf[0] = 128
 		packetBuf[1] = 0
 
-		// Identifier.
 		binary.BigEndian.PutUint16(
 			packetBuf[4:6],
 			0,
 		)
 
-		// Sequence.
 		binary.BigEndian.PutUint16(
 			packetBuf[6:8],
 			seq,
 		)
 
-		// Payload sequence.
 		binary.BigEndian.PutUint32(
 			packetBuf[8:12],
 			uint32(seq),
 		)
 
-		// Timestamp.
 		binary.BigEndian.PutUint64(
 			packetBuf[12:20],
 			ts,
@@ -1455,6 +1487,7 @@ func (d *VirtualTun) doPing(
 	defer icmpReadPool.Put(bufPtr)
 
 	n, err := socket.Read(readBuf)
+
 	if err != nil ||
 		n <= 0 ||
 		n > len(readBuf) {
@@ -1478,10 +1511,11 @@ func (d *VirtualTun) doPing(
 		if replyPing.Seq != int(seq) {
 			return
 		}
-
 	} else {
 		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
-		if !ok || len(replyPing.Data) < 4 {
+
+		if !ok ||
+			len(replyPing.Data) < 4 {
 			return
 		}
 
@@ -1891,7 +1925,5 @@ func (d *VirtualTun) StopPingIPs() {
 
 	d.pingStopMu.Unlock()
 
-	// runPingLoop doesn't acquire pingStopMu,
-	// so waiting here is safe.
 	d.pingLoopWg.Wait()
 }
