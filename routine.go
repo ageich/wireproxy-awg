@@ -941,6 +941,9 @@ func copyBidirectional(
 
 	wg.Add(2)
 
+	// Не вызываем CloseRead() после завершения одного направления.
+	// Для netstack/AWG это может закрыть противоположное направление
+	// раньше времени и резко снизить throughput, особенно upload.
 	go func() {
 		defer wg.Done()
 
@@ -949,8 +952,9 @@ func copyBidirectional(
 			a,
 		)
 
+		// Half-close только write-направления.
+		// Если transport его не поддерживает, закрываем соединение.
 		closeWriteOrClose(b)
-		closeReadOrClose(a)
 	}()
 
 	go func() {
@@ -962,10 +966,14 @@ func copyBidirectional(
 		)
 
 		closeWriteOrClose(a)
-		closeReadOrClose(b)
 	}()
 
 	wg.Wait()
+
+	// После завершения обоих направлений закрываем оба соединения
+	// полностью, чтобы гарантированно освободить ресурсы.
+	_ = a.Close()
+	_ = b.Close()
 }
 
 // ---------- TCP forwards ----------
