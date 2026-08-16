@@ -41,6 +41,7 @@ var defaultDialer = &net.Dialer{
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Ограничивает только установление новых TCP-соединений:
+//
 // DNS resolve + Dial.
 //
 // После успешного Dial semaphore освобождается.
@@ -899,16 +900,6 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 
 // ---------- Bidirectional copy ----------
 
-// Важно:
-// После окончания одного направления НЕ делаем полный Close() второго
-// соединения. Это критично для TCP half-close и особенно важно для
-// netstack/AWG, где преждевременный Close мог обрывать противоположный
-// поток данных.
-//
-// Если CloseWrite поддерживается — закрываем только write half.
-// Если half-close не поддерживается, полное закрытие выполняется только
-// после завершения обоих направлений.
-
 func halfCloseWrite(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -951,9 +942,8 @@ func copyBidirectional(
 		)
 
 		// b -> a завершён.
-		// Закрываем только write-направление b.
-		//
-		// Это позволяет a -> b продолжать работать.
+		// Не закрываем b полностью, чтобы a -> b
+		// мог продолжить передачу.
 		_ = halfCloseWrite(b)
 	}()
 
@@ -966,14 +956,13 @@ func copyBidirectional(
 		)
 
 		// a -> b завершён.
-		// Закрываем только write-направление a.
+		// Не закрываем a полностью.
 		_ = halfCloseWrite(a)
 	}()
 
 	wg.Wait()
 
-	// Оба направления закончены.
-	// Только теперь полностью освобождаем оба соединения.
+	// Оба направления завершены.
 	_ = a.Close()
 	_ = b.Close()
 }
@@ -1159,8 +1148,7 @@ func STDIOTcpForward(
 		_ = sconn.Close()
 
 	case <-done:
-		// Не закрываем здесь sconn немедленно.
-		// Второй поток может ещё передавать данные.
+		// Второе направление может ещё передавать данные.
 	}
 
 	wg.Wait()
@@ -1269,12 +1257,10 @@ func (d *VirtualTun) stopPingWorkers() {
 
 	d.pingMu.Lock()
 
-	if d.pingCancel == cancel {
-		d.pingCancel = nil
-		d.pingCtx = nil
-		d.pingJobs = nil
-		d.pingWorkersStarted = false
-	}
+	d.pingCancel = nil
+	d.pingCtx = nil
+	d.pingJobs = nil
+	d.pingWorkersStarted = false
 
 	d.pingMu.Unlock()
 }
@@ -1831,6 +1817,6 @@ func (d *VirtualTun) StopPingIPs() {
 	d.pingStopMu.Unlock()
 
 	// runPingLoop не берет pingStopMu,
-	// поэтому ожидание здесь безопасно.
+	// поэтому Wait безопасен.
 	d.pingLoopWg.Wait()
 }
