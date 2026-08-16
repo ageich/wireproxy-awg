@@ -159,12 +159,18 @@ func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.refreshReadDeadline(time.Now().UnixNano())
+	c.refreshReadDeadline(
+		time.Now().UnixNano(),
+	)
+
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.refreshWriteDeadline(time.Now().UnixNano())
+	c.refreshWriteDeadline(
+		time.Now().UnixNano(),
+	)
+
 	return c.Conn.Write(p)
 }
 
@@ -900,6 +906,9 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 
 // ---------- Bidirectional copy ----------
 
+// halfCloseWrite оставлен только как вспомогательная функция.
+// В copyBidirectional направление закрытия принципиально важно:
+// после src -> dst закрывается Write именно у dst.
 func halfCloseWrite(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -930,9 +939,16 @@ func copyBidirectional(
 	}
 
 	var wg sync.WaitGroup
-
 	wg.Add(2)
 
+	// b -> a
+	//
+	// ВАЖНО:
+	// после завершения чтения из b закрываем WRITE у a.
+	//
+	// Ранее здесь был CloseWrite(b), что является неправильным
+	// направлением half-close и может обрывать обратный поток
+	// через netstack/AWG.
 	go func() {
 		defer wg.Done()
 
@@ -941,12 +957,12 @@ func copyBidirectional(
 			a,
 		)
 
-		// b -> a завершён.
-		// Не закрываем b полностью, чтобы a -> b
-		// мог продолжить передачу.
-		_ = halfCloseWrite(b)
+		_ = halfCloseWrite(a)
 	}()
 
+	// a -> b
+	//
+	// После завершения чтения из a закрываем WRITE у b.
 	go func() {
 		defer wg.Done()
 
@@ -955,14 +971,12 @@ func copyBidirectional(
 			b,
 		)
 
-		// a -> b завершён.
-		// Не закрываем a полностью.
-		_ = halfCloseWrite(a)
+		_ = halfCloseWrite(b)
 	}()
 
 	wg.Wait()
 
-	// Оба направления завершены.
+	// Оба направления закончились.
 	_ = a.Close()
 	_ = b.Close()
 }
@@ -1105,42 +1119,38 @@ func STDIOTcpForward(
 
 	defer sconn.Close()
 
-	stdout := os.Stdout
-
 	var wg sync.WaitGroup
-
 	wg.Add(2)
 
-	done := make(chan struct{}, 1)
+	done := make(chan struct{})
 
 	go func() {
 		defer wg.Done()
 
+		// STDIN -> tunnel
 		_, _ = CopyWithPool(
-			sconn,
 			os.Stdin,
+			sconn,
 		)
 
+		// Завершено направление STDIN -> tunnel.
+		// Закрываем WRITE у tunnel.
 		_ = halfCloseWrite(sconn)
-
-		select {
-		case done <- struct{}{}:
-		default:
-		}
 	}()
 
 	go func() {
 		defer wg.Done()
 
+		// tunnel -> STDOUT
 		_, _ = CopyWithPool(
-			stdout,
 			sconn,
+			os.Stdout,
 		)
+	}()
 
-		select {
-		case done <- struct{}{}:
-		default:
-		}
+	go func() {
+		wg.Wait()
+		close(done)
 	}()
 
 	select {
@@ -1148,7 +1158,6 @@ func STDIOTcpForward(
 		_ = sconn.Close()
 
 	case <-done:
-		// Второе направление может ещё передавать данные.
 	}
 
 	wg.Wait()
