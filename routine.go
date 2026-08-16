@@ -28,24 +28,22 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
-// ---------- Глобальные оптимизации ----------
+// ---------- Global optimizations ----------
 
 var defaultDialer = &net.Dialer{
 	Timeout:   DialTimeout,
 	KeepAlive: 30 * time.Second,
 }
 
-// 64 KiB.
-// Pool используется SOCKS5 для повторного использования
-// буферов передачи.
+// 64 KiB buffer pool used by SOCKS5.
 var socksPool = bufferpool.NewPool(64 * 1024)
 
-// Ограничивает только установление новых TCP-соединений:
+// Limits only the expensive connection-establishment phase:
 //
-// DNS resolve + Dial.
+//	DNS resolve + TCP Dial
 //
-// После успешного Dial semaphore освобождается.
-// Длительные TCP-соединения semaphore НЕ занимают.
+// Once Dial succeeds the semaphore is released.
+// Long-lived TCP connections do NOT occupy semaphore slots.
 var tcpSemaphore = make(
 	chan struct{},
 	runtime.GOMAXPROCS(0)*256,
@@ -80,12 +78,18 @@ var errHalfCloseUnsupported = errors.New(
 
 // ---------- timeoutConn ----------
 
+// timeoutConn refreshes idle read/write deadlines only when necessary.
+//
+// Deadlines are stored atomically so Read and Write don't need to take
+// a mutex on every operation.
+//
+// A deadline is refreshed when less than 10% of idle timeout remains.
 type timeoutConn struct {
 	net.Conn
 
 	idle          time.Duration
-	refreshBefore int64
 	idleNS        int64
+	refreshBefore int64
 
 	readDeadline  atomic.Int64
 	writeDeadline atomic.Int64
@@ -95,18 +99,25 @@ func newTimeoutConn(
 	conn net.Conn,
 	idle time.Duration,
 ) *timeoutConn {
+	if idle <= 0 {
+		return &timeoutConn{
+			Conn: conn,
+			idle: 0,
+		}
+	}
+
 	idleNS := idle.Nanoseconds()
 
 	refreshBefore := idleNS / 10
-	if refreshBefore <= 0 {
+	if refreshBefore < int64(time.Nanosecond) {
 		refreshBefore = int64(time.Nanosecond)
 	}
 
 	return &timeoutConn{
 		Conn:          conn,
 		idle:          idle,
-		refreshBefore: refreshBefore,
 		idleNS:        idleNS,
+		refreshBefore: refreshBefore,
 	}
 }
 
@@ -122,14 +133,14 @@ func (c *timeoutConn) refreshReadDeadline(nowUnix int64) {
 		return
 	}
 
-	newDeadlineUnix := nowUnix + c.idleNS
+	newDeadline := nowUnix + c.idleNS
 
 	if c.readDeadline.CompareAndSwap(
 		deadline,
-		newDeadlineUnix,
+		newDeadline,
 	) {
 		_ = c.Conn.SetReadDeadline(
-			time.Unix(0, newDeadlineUnix),
+			time.Unix(0, newDeadline),
 		)
 	}
 }
@@ -146,14 +157,14 @@ func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
 		return
 	}
 
-	newDeadlineUnix := nowUnix + c.idleNS
+	newDeadline := nowUnix + c.idleNS
 
 	if c.writeDeadline.CompareAndSwap(
 		deadline,
-		newDeadlineUnix,
+		newDeadline,
 	) {
 		_ = c.Conn.SetWriteDeadline(
-			time.Unix(0, newDeadlineUnix),
+			time.Unix(0, newDeadline),
 		)
 	}
 }
@@ -345,6 +356,12 @@ func (d *VirtualTun) ResolveAddrWithContext(
 	ctx context.Context,
 	name string,
 ) (*netip.Addr, error) {
+	if d == nil {
+		return nil, errors.New(
+			"virtual tun is nil",
+		)
+	}
+
 	addrs, err := d.LookupAddr(
 		ctx,
 		name,
@@ -359,6 +376,8 @@ func (d *VirtualTun) ResolveAddrWithContext(
 		)
 	}
 
+	// math/rand/v2 top-level functions are safe for concurrent use.
+	// No package-level mutex is required.
 	if len(addrs) > 1 {
 		rand.Shuffle(
 			len(addrs),
@@ -372,12 +391,12 @@ func (d *VirtualTun) ResolveAddrWithContext(
 	var lastErr error
 
 	for _, saddr := range addrs {
-		addr, err := netip.ParseAddr(saddr)
-		if err == nil {
+		addr, parseErr := netip.ParseAddr(saddr)
+		if parseErr == nil {
 			return &addr, nil
 		}
 
-		lastErr = err
+		lastErr = parseErr
 	}
 
 	if lastErr == nil {
@@ -434,6 +453,12 @@ func (d *VirtualTun) resolveToAddrPort(
 	ctx context.Context,
 	endpoint *addressPort,
 ) (*netip.AddrPort, error) {
+	if d == nil {
+		return nil, errors.New(
+			"virtual tun is nil",
+		)
+	}
+
 	if endpoint == nil {
 		return nil, errors.New(
 			"endpoint is nil",
@@ -458,6 +483,11 @@ func (d *VirtualTun) resolveToAddrPort(
 
 // ---------- TCP Dial + semaphore ----------
 
+// dialTCPWithSemaphore limits only:
+//
+//	resolve + Dial
+//
+// It deliberately releases the semaphore before returning the connection.
 func dialTCPWithSemaphore(
 	ctx context.Context,
 	vt *VirtualTun,
@@ -466,6 +496,12 @@ func dialTCPWithSemaphore(
 	if vt == nil {
 		return nil, errors.New(
 			"virtual tun is nil",
+		)
+	}
+
+	if vt.Tnet == nil {
+		return nil, errors.New(
+			"network stack is nil",
 		)
 	}
 
@@ -551,12 +587,12 @@ func (config *Socks5Config) SpawnRoutine(
 	}
 
 	dial := func(
-		ctx context.Context,
+		dialCtx context.Context,
 		network string,
 		addr string,
 	) (net.Conn, error) {
 		return dialWithTimeout(
-			ctx,
+			dialCtx,
 			network,
 			addr,
 			vt,
@@ -590,11 +626,20 @@ func (config *Socks5Config) SpawnRoutine(
 				err,
 			)
 
+			timer := time.NewTimer(5 * time.Second)
+
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+
 				return nil
 
-			case <-time.After(5 * time.Second):
+			case <-timer.C:
 			}
 
 			continue
@@ -605,10 +650,16 @@ func (config *Socks5Config) SpawnRoutine(
 			idle:     IdleTimeout,
 		}
 
-		go func(l net.Listener) {
-			<-ctx.Done()
+		go func(
+			l net.Listener,
+			cancelCtx context.Context,
+		) {
+			<-cancelCtx.Done()
 			_ = l.Close()
-		}(rawListener)
+		}(
+			rawListener,
+			ctx,
+		)
 
 		Log.Info(
 			"SOCKS5 server started",
@@ -631,11 +682,20 @@ func (config *Socks5Config) SpawnRoutine(
 
 		_ = rawListener.Close()
 
+		timer := time.NewTimer(5 * time.Second)
+
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
 			return nil
 
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 		}
 	}
 }
@@ -906,9 +966,10 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 
 // ---------- Bidirectional copy ----------
 
-// halfCloseWrite оставлен только как вспомогательная функция.
-// В copyBidirectional направление закрытия принципиально важно:
-// после src -> dst закрывается Write именно у dst.
+// halfCloseWrite closes only the write side.
+// The direction is:
+//
+//	src -> dst  => CloseWrite(dst)
 func halfCloseWrite(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -942,13 +1003,6 @@ func copyBidirectional(
 	wg.Add(2)
 
 	// b -> a
-	//
-	// ВАЖНО:
-	// после завершения чтения из b закрываем WRITE у a.
-	//
-	// Ранее здесь был CloseWrite(b), что является неправильным
-	// направлением half-close и может обрывать обратный поток
-	// через netstack/AWG.
 	go func() {
 		defer wg.Done()
 
@@ -957,12 +1011,11 @@ func copyBidirectional(
 			a,
 		)
 
+		// EOF from b means that a's write direction must be closed.
 		_ = halfCloseWrite(a)
 	}()
 
 	// a -> b
-	//
-	// После завершения чтения из a закрываем WRITE у b.
 	go func() {
 		defer wg.Done()
 
@@ -971,12 +1024,13 @@ func copyBidirectional(
 			b,
 		)
 
+		// EOF from a means that b's write direction must be closed.
 		_ = halfCloseWrite(b)
 	}()
 
 	wg.Wait()
 
-	// Оба направления закончились.
+	// Both directions have completed.
 	_ = a.Close()
 	_ = b.Close()
 }
@@ -1011,15 +1065,17 @@ func tcpClientForward(
 		raddr,
 	)
 	if err != nil {
-		Log.Error(
-			"TCP Client Tunnel dial error",
-			"address",
-			raddr.address,
-			"port",
-			raddr.port,
-			"error",
-			err,
-		)
+		if ctx.Err() == nil {
+			Log.Error(
+				"TCP Client Tunnel dial error",
+				"address",
+				raddr.address,
+				"port",
+				raddr.port,
+				"error",
+				err,
+			)
+		}
 
 		return
 	}
@@ -1060,15 +1116,17 @@ func tcpServerForward(
 		raddr,
 	)
 	if err != nil {
-		Log.Error(
-			"TCP Server Tunnel dial error",
-			"address",
-			raddr.address,
-			"port",
-			raddr.port,
-			"error",
-			err,
-		)
+		if ctx.Err() == nil {
+			Log.Error(
+				"TCP Server Tunnel dial error",
+				"address",
+				raddr.address,
+				"port",
+				raddr.port,
+				"error",
+				err,
+			)
+		}
 
 		return
 	}
@@ -1104,15 +1162,17 @@ func STDIOTcpForward(
 		raddr,
 	)
 	if err != nil {
-		Log.Error(
-			"STDIO TCP Tunnel dial error",
-			"address",
-			raddr.address,
-			"port",
-			raddr.port,
-			"error",
-			err,
-		)
+		if ctx.Err() == nil {
+			Log.Error(
+				"STDIO TCP Tunnel dial error",
+				"address",
+				raddr.address,
+				"port",
+				raddr.port,
+				"error",
+				err,
+			)
+		}
 
 		return
 	}
@@ -1133,8 +1193,6 @@ func STDIOTcpForward(
 			sconn,
 		)
 
-		// Завершено направление STDIN -> tunnel.
-		// Закрываем WRITE у tunnel.
 		_ = halfCloseWrite(sconn)
 	}()
 
@@ -1189,6 +1247,7 @@ func (d *VirtualTun) initPingWorkers() {
 		workers = 2
 	}
 
+	// Avoid creating an excessively large queue.
 	queueSize := workers * 8
 
 	if queueSize < 16 {
@@ -1300,68 +1359,75 @@ func (d *VirtualTun) doPing(
 	var packetBuf [24]byte
 	var proto int
 
-	if addr.Is4() {
+	switch {
+	case addr.Is4():
 		proto = 1
 
+		// ICMP Echo Request.
 		packetBuf[0] = 8
 		packetBuf[1] = 0
 
+		// Identifier.
 		binary.BigEndian.PutUint16(
 			packetBuf[4:6],
 			0,
 		)
 
+		// Sequence.
 		binary.BigEndian.PutUint16(
 			packetBuf[6:8],
 			seq,
 		)
 
+		// Payload sequence.
 		binary.BigEndian.PutUint32(
 			packetBuf[8:12],
 			uint32(seq),
 		)
 
+		// Timestamp.
 		binary.BigEndian.PutUint64(
 			packetBuf[12:20],
 			ts,
-		)
-
-		cs := checksum(
-			packetBuf[:20],
 		)
 
 		binary.BigEndian.PutUint16(
 			packetBuf[2:4],
-			cs,
+			checksum(packetBuf[:20]),
 		)
 
-	} else if addr.Is6() {
+	case addr.Is6():
 		proto = 58
 
+		// ICMPv6 Echo Request.
 		packetBuf[0] = 128
 		packetBuf[1] = 0
 
+		// Identifier.
 		binary.BigEndian.PutUint16(
 			packetBuf[4:6],
 			0,
 		)
 
+		// Sequence.
 		binary.BigEndian.PutUint16(
 			packetBuf[6:8],
 			seq,
 		)
 
+		// Payload sequence.
 		binary.BigEndian.PutUint32(
 			packetBuf[8:12],
 			uint32(seq),
 		)
 
+		// Timestamp.
 		binary.BigEndian.PutUint64(
 			packetBuf[12:20],
 			ts,
 		)
 
-	} else {
+	default:
 		return
 	}
 
@@ -1412,6 +1478,7 @@ func (d *VirtualTun) doPing(
 		if replyPing.Seq != int(seq) {
 			return
 		}
+
 	} else {
 		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
 		if !ok || len(replyPing.Data) < 4 {
@@ -1460,6 +1527,8 @@ func checksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// ---------- Ping queue ----------
+
 func (d *VirtualTun) pingIPs() {
 	if d == nil ||
 		d.Conf == nil {
@@ -1476,13 +1545,6 @@ func (d *VirtualTun) pingIPs() {
 	if jobs == nil ||
 		pingCtx == nil {
 		return
-	}
-
-	select {
-	case <-pingCtx.Done():
-		return
-
-	default:
 	}
 
 	seq := uint16(
@@ -1532,7 +1594,8 @@ func (d *VirtualTun) ServeHTTP(
 
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
-		if d.PingRecord == nil {
+		if d == nil ||
+			d.PingRecord == nil {
 			w.WriteHeader(
 				http.StatusServiceUnavailable,
 			)
@@ -1586,10 +1649,13 @@ func (d *VirtualTun) ServeHTTP(
 			)
 		}
 
-		_, _ = w.Write([]byte("\n"))
+		_, _ = w.Write(
+			[]byte("\n"),
+		)
 
 	case "/metrics":
-		if d.Dev == nil {
+		if d == nil ||
+			d.Dev == nil {
 			w.WriteHeader(
 				http.StatusInternalServerError,
 			)
@@ -1825,7 +1891,7 @@ func (d *VirtualTun) StopPingIPs() {
 
 	d.pingStopMu.Unlock()
 
-	// runPingLoop не берет pingStopMu,
-	// поэтому Wait безопасен.
+	// runPingLoop doesn't acquire pingStopMu,
+	// so waiting here is safe.
 	d.pingLoopWg.Wait()
 }
