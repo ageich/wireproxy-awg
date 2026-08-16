@@ -35,14 +35,13 @@ var defaultDialer = &net.Dialer{
 	KeepAlive: 30 * time.Second,
 }
 
-// Оставляем 64 KiB.
-// Pool используется самим SOCKS5 для повторного использования
+// 64 KiB.
+// Pool используется SOCKS5 для повторного использования
 // буферов передачи.
 var socksPool = bufferpool.NewPool(64 * 1024)
 
 // Ограничивает только установление новых TCP-соединений:
-//
-// resolve DNS + Dial
+// DNS resolve + Dial.
 //
 // После успешного Dial semaphore освобождается.
 // Длительные TCP-соединения semaphore НЕ занимают.
@@ -159,18 +158,12 @@ func (c *timeoutConn) refreshWriteDeadline(nowUnix int64) {
 }
 
 func (c *timeoutConn) Read(p []byte) (int, error) {
-	c.refreshReadDeadline(
-		time.Now().UnixNano(),
-	)
-
+	c.refreshReadDeadline(time.Now().UnixNano())
 	return c.Conn.Read(p)
 }
 
 func (c *timeoutConn) Write(p []byte) (int, error) {
-	c.refreshWriteDeadline(
-		time.Now().UnixNano(),
-	)
-
+	c.refreshWriteDeadline(time.Now().UnixNano())
 	return c.Conn.Write(p)
 }
 
@@ -269,8 +262,9 @@ func (c CredentialValidator) Valid(
 // ---------- VirtualTun ----------
 
 type VirtualTun struct {
-	Tnet      *netstack.Net
-	Dev       *device.Device
+	Tnet *netstack.Net
+	Dev  *device.Device
+
 	SystemDNS bool
 	Conf      *DeviceConfig
 
@@ -462,6 +456,18 @@ func dialTCPWithSemaphore(
 	vt *VirtualTun,
 	raddr *addressPort,
 ) (net.Conn, error) {
+	if vt == nil {
+		return nil, errors.New(
+			"virtual tun is nil",
+		)
+	}
+
+	if raddr == nil {
+		return nil, errors.New(
+			"remote address is nil",
+		)
+	}
+
 	select {
 	case tcpSemaphore <- struct{}{}:
 		defer func() {
@@ -539,7 +545,7 @@ func (config *Socks5Config) SpawnRoutine(
 
 	dial := func(
 		ctx context.Context,
-		network,
+		network string,
 		addr string,
 	) (net.Conn, error) {
 		return dialWithTimeout(
@@ -893,32 +899,27 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(
 
 // ---------- Bidirectional copy ----------
 
-func closeWriteOrClose(conn net.Conn) {
+// Важно:
+// После окончания одного направления НЕ делаем полный Close() второго
+// соединения. Это критично для TCP half-close и особенно важно для
+// netstack/AWG, где преждевременный Close мог обрывать противоположный
+// поток данных.
+//
+// Если CloseWrite поддерживается — закрываем только write half.
+// Если half-close не поддерживается, полное закрытие выполняется только
+// после завершения обоих направлений.
+
+func halfCloseWrite(conn net.Conn) bool {
 	if conn == nil {
-		return
+		return false
 	}
 
-	if cw, ok := conn.(closeWriter); ok {
-		if err := cw.CloseWrite(); err == nil {
-			return
-		}
+	cw, ok := conn.(closeWriter)
+	if !ok {
+		return false
 	}
 
-	_ = conn.Close()
-}
-
-func closeReadOrClose(conn net.Conn) {
-	if conn == nil {
-		return
-	}
-
-	if cr, ok := conn.(closeReader); ok {
-		if err := cr.CloseRead(); err == nil {
-			return
-		}
-	}
-
-	_ = conn.Close()
+	return cw.CloseWrite() == nil
 }
 
 func copyBidirectional(
@@ -941,9 +942,6 @@ func copyBidirectional(
 
 	wg.Add(2)
 
-	// Не вызываем CloseRead() после завершения одного направления.
-	// Для netstack/AWG это может закрыть противоположное направление
-	// раньше времени и резко снизить throughput, особенно upload.
 	go func() {
 		defer wg.Done()
 
@@ -952,9 +950,11 @@ func copyBidirectional(
 			a,
 		)
 
-		// Half-close только write-направления.
-		// Если transport его не поддерживает, закрываем соединение.
-		closeWriteOrClose(b)
+		// b -> a завершён.
+		// Закрываем только write-направление b.
+		//
+		// Это позволяет a -> b продолжать работать.
+		_ = halfCloseWrite(b)
 	}()
 
 	go func() {
@@ -965,13 +965,15 @@ func copyBidirectional(
 			b,
 		)
 
-		closeWriteOrClose(a)
+		// a -> b завершён.
+		// Закрываем только write-направление a.
+		_ = halfCloseWrite(a)
 	}()
 
 	wg.Wait()
 
-	// После завершения обоих направлений закрываем оба соединения
-	// полностью, чтобы гарантированно освободить ресурсы.
+	// Оба направления закончены.
+	// Только теперь полностью освобождаем оба соединения.
 	_ = a.Close()
 	_ = b.Close()
 }
@@ -1130,7 +1132,7 @@ func STDIOTcpForward(
 			os.Stdin,
 		)
 
-		closeWriteOrClose(sconn)
+		_ = halfCloseWrite(sconn)
 
 		select {
 		case done <- struct{}{}:
@@ -1146,8 +1148,6 @@ func STDIOTcpForward(
 			sconn,
 		)
 
-		closeReadOrClose(sconn)
-
 		select {
 		case done <- struct{}{}:
 		default:
@@ -1159,15 +1159,22 @@ func STDIOTcpForward(
 		_ = sconn.Close()
 
 	case <-done:
-		_ = sconn.Close()
+		// Не закрываем здесь sconn немедленно.
+		// Второй поток может ещё передавать данные.
 	}
 
 	wg.Wait()
+
+	_ = sconn.Close()
 }
 
 // ---------- ICMP worker pool ----------
 
 func (d *VirtualTun) initPingWorkers() {
+	if d == nil {
+		return
+	}
+
 	d.pingMu.Lock()
 	defer d.pingMu.Unlock()
 
@@ -1239,6 +1246,10 @@ func (d *VirtualTun) initPingWorkers() {
 }
 
 func (d *VirtualTun) stopPingWorkers() {
+	if d == nil {
+		return
+	}
+
 	d.pingMu.Lock()
 
 	if !d.pingWorkersStarted {
@@ -1258,10 +1269,12 @@ func (d *VirtualTun) stopPingWorkers() {
 
 	d.pingMu.Lock()
 
-	d.pingCancel = nil
-	d.pingCtx = nil
-	d.pingJobs = nil
-	d.pingWorkersStarted = false
+	if d.pingCancel == cancel {
+		d.pingCancel = nil
+		d.pingCtx = nil
+		d.pingJobs = nil
+		d.pingWorkersStarted = false
+	}
 
 	d.pingMu.Unlock()
 }
@@ -1687,6 +1700,10 @@ func (d *VirtualTun) ServeHTTP(
 // ---------- Ping lifecycle ----------
 
 func (d *VirtualTun) StartPingIPs() {
+	if d == nil {
+		return
+	}
+
 	d.pingStopMu.Lock()
 	defer d.pingStopMu.Unlock()
 
@@ -1761,13 +1778,12 @@ func (d *VirtualTun) runPingLoop(
 				recovered,
 			)
 
-			// Не брать pingStopMu здесь:
-			// StopPingIPs может держать его во время Wait().
 			d.stopPingWorkers()
 		}
 	}()
 
 	d.initPingWorkers()
+
 	d.pingIPs()
 
 	interval := 5 * time.Second
@@ -1796,19 +1812,25 @@ func (d *VirtualTun) runPingLoop(
 }
 
 func (d *VirtualTun) StopPingIPs() {
+	if d == nil {
+		return
+	}
+
 	d.pingStopMu.Lock()
-	defer d.pingStopMu.Unlock()
 
 	stop := d.pingStop
 
 	if stop == nil {
+		d.pingStopMu.Unlock()
 		return
 	}
 
 	close(stop)
 	d.pingStop = nil
 
+	d.pingStopMu.Unlock()
+
 	// runPingLoop не берет pingStopMu,
-	// поэтому Wait безопасен.
+	// поэтому ожидание здесь безопасно.
 	d.pingLoopWg.Wait()
 }
