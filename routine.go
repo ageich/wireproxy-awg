@@ -46,11 +46,13 @@ var socksPool = bufferpool.NewPool(64 * 1024)
 // The semaphore is released immediately after Dial succeeds.
 // Long-lived TCP connections do NOT consume semaphore slots.
 //
-// A larger limit improves burst connection establishment without
-// affecting established TCP throughput.
+// For a 1-core VPS, 128 concurrent connection-establishment
+// operations are already a very large burst. Increasing this value
+// does not improve established TCP throughput because the semaphore
+// is released before the connection is returned.
 var tcpSemaphore = make(
 	chan struct{},
-	max(512, runtime.GOMAXPROCS(0)*512),
+	max(128, runtime.GOMAXPROCS(0)*128),
 )
 
 // ---------- ICMP read buffer pool ----------
@@ -85,11 +87,19 @@ var errHalfCloseUnsupported = errors.New(
 // timeoutConn maintains an idle timeout without changing deadlines
 // on every packet.
 //
-// The important optimization here is that SetReadDeadline/SetWriteDeadline
-// are relatively expensive operations. We therefore refresh only when the
-// current deadline is close to expiration.
+// The atomic deadline values provide a cheap fast path for the normal
+// case. A mutex is used only when the deadline actually needs to be
+// refreshed, because SetReadDeadline/SetWriteDeadline must not be
+// allowed to race with each other.
 //
-// Atomic deadlines allow concurrent Read/Write without a mutex.
+// This avoids the following race:
+//
+//	goroutine A: CAS -> deadline A
+//	goroutine B: CAS -> deadline B
+//	goroutine B: SetDeadline(B)
+//	goroutine A: SetDeadline(A)
+//
+// which could otherwise leave the socket with an older deadline.
 type timeoutConn struct {
 	net.Conn
 
@@ -98,6 +108,9 @@ type timeoutConn struct {
 
 	readDeadline  atomic.Int64
 	writeDeadline atomic.Int64
+
+	readDeadlineMu  sync.Mutex
+	writeDeadlineMu sync.Mutex
 }
 
 func newTimeoutConn(
@@ -145,6 +158,18 @@ func (c *timeoutConn) refreshReadDeadline(now int64) {
 		return
 	}
 
+	c.readDeadlineMu.Lock()
+	defer c.readDeadlineMu.Unlock()
+
+	// Another goroutine may have refreshed the deadline while
+	// we were waiting for the mutex.
+	deadline = c.readDeadline.Load()
+
+	if deadline != 0 &&
+		now < deadline-c.refreshBefore {
+		return
+	}
+
 	newDeadline := now + idleNS
 
 	if c.readDeadline.CompareAndSwap(
@@ -167,6 +192,18 @@ func (c *timeoutConn) refreshWriteDeadline(now int64) {
 	deadline := c.writeDeadline.Load()
 
 	// Fast path: deadline still has plenty of time.
+	if deadline != 0 &&
+		now < deadline-c.refreshBefore {
+		return
+	}
+
+	c.writeDeadlineMu.Lock()
+	defer c.writeDeadlineMu.Unlock()
+
+	// Another goroutine may have refreshed the deadline while
+	// we were waiting for the mutex.
+	deadline = c.writeDeadline.Load()
+
 	if deadline != 0 &&
 		now < deadline-c.refreshBefore {
 		return
@@ -467,7 +504,7 @@ func parseAddressPort(
 
 	return &addressPort{
 		address: name,
-		port:    uint16(port),
+		port: uint16(port),
 	}, nil
 }
 
@@ -566,8 +603,7 @@ func dialTCPWithSemaphore(
 
 	// RELEASE BEFORE RETURNING THE CONNECTION.
 	//
-	// This is critical for high-throughput workloads with many
-	// long-lived TCP connections.
+	// Established TCP connections never consume semaphore capacity.
 	<-tcpSemaphore
 
 	return conn, err
@@ -1502,30 +1538,15 @@ func (d *VirtualTun) doPing(
 		return
 	}
 
-	if addr.Is4() {
-		replyPing, ok := replyPacket.Body.(*icmp.Echo)
-		if !ok {
-			return
-		}
+	// Both ICMPv4 Echo Reply and ICMPv6 Echo Reply are decoded
+	// as *icmp.Echo by golang.org/x/net/icmp.
+	replyPing, ok := replyPacket.Body.(*icmp.Echo)
+	if !ok {
+		return
+	}
 
-		if replyPing.Seq != int(seq) {
-			return
-		}
-	} else {
-		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
-
-		if !ok ||
-			len(replyPing.Data) < 4 {
-			return
-		}
-
-		rxSeq := binary.BigEndian.Uint16(
-			replyPing.Data[2:4],
-		)
-
-		if rxSeq != seq {
-			return
-		}
+	if replyPing.Seq != int(seq) {
+		return
 	}
 
 	if d.PingRecord != nil {
@@ -1807,13 +1828,25 @@ func (d *VirtualTun) StartPingIPs() {
 		return
 	}
 
-	ttl := time.Duration(
-		d.Conf.CheckAliveInterval+2,
-	) * time.Second
+	// Keep PingRecord alive until at least the next ping plus a
+	// small safety margin.
+	//
+	// Previously this was calculated as:
+	//
+	//	CheckAliveInterval + 2
+	//
+	// even when CheckAliveInterval == 0, producing a 2-second TTL
+	// while the actual ping interval was 5 seconds.
+	interval := 5 * time.Second
 
-	if ttl <= 0 {
-		ttl = 7 * time.Second
+	if d.Conf.CheckAliveInterval > 0 {
+		interval =
+			time.Duration(
+				d.Conf.CheckAliveInterval,
+			) * time.Second
 	}
+
+	ttl := interval + 2*time.Second
 
 	cacheSize := d.DnsCacheSize
 
