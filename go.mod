@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/MakeNowJust/heredoc/v2 v2.0.1
 	github.com/ageich/go-socks5 v0.1.5-0.20260812161949-fbfa09121a4a
+	github.com/akamensky/argparse v1.4.0
 	github.com/amnezia-vpn/amneziawg-go v0.2.19
 	github.com/go-ini/ini v1.67.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7

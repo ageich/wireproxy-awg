@@ -41,13 +41,13 @@ func extractPort(addr string) (uint16, error) {
 
 func lockNetwork(
 	sections []wireproxyawg.RoutineSpawner,
-	infoAddr string,
-	pprofAddr string,
+	infoAddr *string,
+	pprofAddr *string,
 ) error {
 	var rules []landlock.Rule
 
-	if infoAddr != "" {
-		port, err := extractPort(infoAddr)
+	if infoAddr != nil && *infoAddr != "" {
+		port, err := extractPort(*infoAddr)
 		if err != nil {
 			return err
 		}
@@ -58,8 +58,8 @@ func lockNetwork(
 		)
 	}
 
-	if pprofAddr != "" {
-		port, err := extractPort(pprofAddr)
+	if pprofAddr != nil && *pprofAddr != "" {
+		port, err := extractPort(*pprofAddr)
 		if err != nil {
 			return err
 		}
@@ -72,10 +72,9 @@ func lockNetwork(
 
 	for _, section := range sections {
 		switch section := section.(type) {
+
 		case *wireproxyawg.TCPServerTunnelConfig:
-			port, err := extractPort(
-				section.Target,
-			)
+			port, err := extractPort(section.Target)
 			if err != nil {
 				return err
 			}
@@ -86,9 +85,7 @@ func lockNetwork(
 			)
 
 		case *wireproxyawg.HTTPConfig:
-			port, err := extractPort(
-				section.BindAddress,
-			)
+			port, err := extractPort(section.BindAddress)
 			if err != nil {
 				return err
 			}
@@ -136,7 +133,7 @@ func lockNetwork(
 		return nil
 	}
 
-	return landlock.V4.
-		BestEffort().
-		RestrictNet(rules...)
+	return landlock.V4.BestEffort().RestrictNet(
+		rules...,
+	)
 }

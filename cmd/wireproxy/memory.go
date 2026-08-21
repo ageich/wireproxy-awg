@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"runtime"
@@ -14,13 +13,23 @@ import (
 	wireproxyawg "github.com/ageich/wireproxy-awg"
 )
 
+// parseSize converts:
+//
+//	512KiB
+//	512MiB
+//	512GiB
+//	512KB
+//	512MB
+//	512GB
+//
+// into bytes.
+//
+// If no suffix is present, the value is interpreted as bytes.
 func parseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 
 	if s == "" {
-		return 0, fmt.Errorf(
-			"empty size string",
-		)
+		return 0, strconv.ErrSyntax
 	}
 
 	lower := strings.ToLower(s)
@@ -55,43 +64,30 @@ func parseSize(s string) (int64, error) {
 
 	valueString := strings.TrimSpace(s)
 
-	val, err := strconv.ParseInt(
-		valueString,
-		10,
-		64,
-	)
+	val, err := strconv.ParseInt(valueString, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf(
-			"invalid number format: %w",
-			err,
-		)
+		return 0, err
 	}
 
 	if val <= 0 {
-		return 0, fmt.Errorf(
-			"size must be positive",
-		)
+		return 0, strconv.ErrRange
 	}
 
 	const maxInt64 = int64(^uint64(0) >> 1)
 
 	if val > maxInt64/multiplier {
-		return 0, fmt.Errorf(
-			"size overflows int64",
-		)
+		return 0, strconv.ErrRange
 	}
 
 	return val * multiplier, nil
 }
 
 func setMemoryLimitFromEnvAndFlags(
-	memlimitFlag int,
+	memlimitFlag *int,
 ) (int64, error) {
 	var limitBytes int64
 
-	envLimit := os.Getenv(
-		"GOMEMLIMIT",
-	)
+	envLimit := os.Getenv("GOMEMLIMIT")
 
 	if envLimit != "" {
 		val, err := parseSize(envLimit)
@@ -108,27 +104,20 @@ func setMemoryLimitFromEnvAndFlags(
 		}
 	}
 
-	if memlimitFlag > 0 {
+	if memlimitFlag != nil && *memlimitFlag > 0 {
 		const maxInt64 = int64(^uint64(0) >> 1)
 
-		flagValue := int64(memlimitFlag)
+		flagValue := int64(*memlimitFlag)
 
 		if flagValue > maxInt64/(1024*1024) {
-			return 0, fmt.Errorf(
-				"max-memory value is too large",
-			)
+			return 0, strconv.ErrRange
 		}
 
-		limitBytes =
-			flagValue *
-				1024 *
-				1024
+		limitBytes = flagValue * 1024 * 1024
 	}
 
 	if limitBytes > 0 {
-		debug.SetMemoryLimit(
-			limitBytes,
-		)
+		debug.SetMemoryLimit(limitBytes)
 
 		slog.Info(
 			"Memory limit set",
@@ -137,12 +126,12 @@ func setMemoryLimitFromEnvAndFlags(
 			"mb",
 			limitBytes/(1024*1024),
 			"gib",
-			float64(limitBytes)/
-				(1024*1024*1024),
+			float64(limitBytes)/(1024*1024*1024),
 		)
 	} else {
 		slog.Info(
 			"No memory limit set",
+			"hint",
 			"use GOMEMLIMIT env or --max-memory flag",
 		)
 	}
@@ -158,23 +147,25 @@ func adjustCacheSizes(
 		return
 	}
 
+	// Only a small fraction of the memory limit is assigned
+	// to explicitly configured caches.
 	total := limitBytes / 10
 
 	dns := int(
-		float64(total)*
-			0.30/
+		float64(total) *
+			0.30 /
 			64,
 	)
 
 	ping := int(
-		float64(total)*
-			0.10/
+		float64(total) *
+			0.10 /
 			8,
 	)
 
 	udp := int(
-		float64(total)*
-			0.60/
+		float64(total) *
+			0.60 /
 			1024,
 	)
 
@@ -227,6 +218,12 @@ func adjustCacheSizes(
 	}
 }
 
+// startMemoryMonitor periodically runs GC for long-running
+// low-memory VPS deployments.
+//
+// GOMEMLIMIT remains the primary memory management mechanism.
+// We deliberately do not call debug.FreeOSMemory(), because
+// doing so periodically can introduce unnecessary latency.
 func startMemoryMonitor(
 	ctx context.Context,
 	interval time.Duration,

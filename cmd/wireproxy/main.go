@@ -5,19 +5,19 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/device"
 	wireproxyawg "github.com/ageich/wireproxy-awg"
+	"github.com/akamensky/argparse"
+	"github.com/amnezia-vpn/amneziawg-go/device"
 )
 
-const daemonProcess = "daemon-process"
-
-// version – переопределяется при сборке через -ldflags
 var version = "1.0.26"
 
 func main() {
@@ -28,14 +28,161 @@ func main() {
 		),
 	)
 
+	// Detect daemon child before argparse.
+	isDaemonProcess :=
+		len(os.Args) > 1 &&
+			os.Args[1] == daemonProcess
+
+	parseArgs := os.Args
+
+	if isDaemonProcess {
+		parseArgs = make(
+			[]string,
+			0,
+			len(os.Args)-1,
+		)
+
+		parseArgs = append(
+			parseArgs,
+			os.Args[0],
+		)
+
+		parseArgs = append(
+			parseArgs,
+			os.Args[2:]...,
+		)
+	}
+
 	// ------------------------------------------------------------
 	// Arguments
 	// ------------------------------------------------------------
 
-	args, err := parseCommandLine()
-	if err != nil {
+	parser := argparse.NewParser(
+		"wireproxy",
+		"Userspace wireguard client for proxying",
+	)
+
+	config := parser.String(
+		"c",
+		"config",
+		&argparse.Options{
+			Help: "Path of configuration file",
+		},
+	)
+
+	silent := parser.Flag(
+		"s",
+		"silent",
+		&argparse.Options{
+			Help: "Silent mode",
+		},
+	)
+
+	daemon := parser.Flag(
+		"d",
+		"daemon",
+		&argparse.Options{
+			Help: "Make wireproxy run in background",
+		},
+	)
+
+	info := parser.String(
+		"i",
+		"info",
+		&argparse.Options{
+			Help: "Specify the address and port for exposing health status",
+		},
+	)
+
+	printVersion := parser.Flag(
+		"v",
+		"version",
+		&argparse.Options{
+			Help: "Print version",
+		},
+	)
+
+	configTest := parser.Flag(
+		"n",
+		"configtest",
+		&argparse.Options{
+			Help: "Configtest mode. Only check the configuration file for validity.",
+		},
+	)
+
+	memlimit := parser.Int(
+		"",
+		"max-memory",
+		&argparse.Options{
+			Help: "Set maximum memory limit in megabytes",
+		},
+	)
+
+	logLevelFlag := parser.String(
+		"",
+		"log-level",
+		&argparse.Options{
+			Help:    "Log level (debug, info, warn, error)",
+			Default: "info",
+		},
+	)
+
+	pprofAddr := parser.String(
+		"",
+		"pprof",
+		&argparse.Options{
+			Help: "Enable pprof HTTP server",
+		},
+	)
+
+	if err := parser.Parse(parseArgs); err != nil {
+		fmt.Print(parser.Usage(err))
 		os.Exit(1)
 	}
+
+	// ------------------------------------------------------------
+	// Logging
+	// ------------------------------------------------------------
+
+	if err := wireproxyawg.SetLogLevel(
+		*logLevelFlag,
+	); err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"Invalid log level: %v\n",
+			err,
+		)
+		os.Exit(1)
+	}
+
+	if *silent {
+		wireproxyawg.SetLogLevel("error")
+	}
+
+	// ------------------------------------------------------------
+	// Context / signals
+	// ------------------------------------------------------------
+
+	ctx, cancel := context.WithCancel(
+		context.Background(),
+	)
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+
+	signal.Notify(
+		sigCh,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+		syscall.SIGHUP,
+	)
+
+	// ------------------------------------------------------------
+	// Executable
+	// ------------------------------------------------------------
+
+	exePath := executablePath()
 
 	// ------------------------------------------------------------
 	// Initial sandbox
@@ -50,7 +197,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if args.isDaemonProcess {
+	if isDaemonProcess {
 		if err := lock("boot-daemon"); err != nil {
 			slog.Error(
 				"Lock boot-daemon failed",
@@ -66,7 +213,7 @@ func main() {
 	// ------------------------------------------------------------
 
 	limitBytes, err := setMemoryLimitFromEnvAndFlags(
-		args.memlimit,
+		memlimit,
 	)
 	if err != nil {
 		slog.Error(
@@ -81,7 +228,7 @@ func main() {
 	// Version
 	// ------------------------------------------------------------
 
-	if args.printVersion {
+	if *printVersion {
 		fmt.Printf(
 			"wireproxy, version %s\n",
 			version,
@@ -90,12 +237,12 @@ func main() {
 	}
 
 	// ------------------------------------------------------------
-	// Config path
+	// Configuration path
 	// ------------------------------------------------------------
 
-	if args.config == "" {
+	if *config == "" {
 		if path, exists := configFilePath(); exists {
-			args.config = path
+			*config = path
 		} else {
 			fmt.Println(
 				"configuration path is required",
@@ -105,10 +252,21 @@ func main() {
 	}
 
 	// ------------------------------------------------------------
-	// Config sandbox
+	// Config read sandbox
 	// ------------------------------------------------------------
 
-	if !args.isDaemonProcess || args.daemon {
+	if !isDaemonProcess && !*daemon {
+		if err := lock("read-config"); err != nil {
+			slog.Error(
+				"Lock read-config failed",
+				"error",
+				err,
+			)
+			os.Exit(1)
+		}
+	}
+
+	if *daemon && !isDaemonProcess {
 		if err := lock("read-config"); err != nil {
 			slog.Error(
 				"Lock read-config failed",
@@ -120,11 +278,11 @@ func main() {
 	}
 
 	// ------------------------------------------------------------
-	// Parse config
+	// Parse configuration
 	// ------------------------------------------------------------
 
 	conf, err := wireproxyawg.ParseConfig(
-		args.config,
+		*config,
 	)
 	if err != nil {
 		slog.Error(
@@ -135,7 +293,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if args.configTest {
+	// ------------------------------------------------------------
+	// Config test
+	// ------------------------------------------------------------
+
+	if *configTest {
 		fmt.Println("Config OK")
 		return
 	}
@@ -146,8 +308,8 @@ func main() {
 
 	if err := lockNetwork(
 		conf.Routines,
-		args.info,
-		args.pprofAddr,
+		info,
+		pprofAddr,
 	); err != nil {
 		slog.Error(
 			"Lock network failed",
@@ -161,11 +323,13 @@ func main() {
 	// Daemon
 	// ------------------------------------------------------------
 
-	if args.daemon && !args.isDaemonProcess {
-		if err := daemonize(); err != nil {
-			slog.Error(
-				"Failed to start daemon",
-				"error",
+	if *daemon && !isDaemonProcess {
+		if err := startDaemon(
+			exePath,
+			os.Args,
+		); err != nil {
+			fmt.Fprintln(
+				os.Stderr,
 				err,
 			)
 			os.Exit(1)
@@ -178,26 +342,24 @@ func main() {
 	// Daemon child output
 	// ------------------------------------------------------------
 
-	if args.isDaemonProcess {
+	if isDaemonProcess {
 		redirectDaemonOutput()
-		args.daemon = false
+		*daemon = false
 	}
 
-	// Preserve stderr for device logging.
-	os.Stdout = os.NewFile(
-		uintptr(syscall.Stderr),
-		"/dev/stderr",
-	)
-
 	// ------------------------------------------------------------
-	// Final sandbox
+	// WireGuard log level
 	// ------------------------------------------------------------
 
 	logLevel := device.LogLevelVerbose
 
-	if args.silent {
+	if *silent {
 		logLevel = device.LogLevelSilent
 	}
+
+	// ------------------------------------------------------------
+	// Final sandbox
+	// ------------------------------------------------------------
 
 	if err := lock("ready"); err != nil {
 		slog.Error(
@@ -218,7 +380,7 @@ func main() {
 	)
 
 	// ------------------------------------------------------------
-	// WireGuard
+	// Start WireGuard
 	// ------------------------------------------------------------
 
 	tun, err := wireproxyawg.StartWireguard(
@@ -247,42 +409,31 @@ func main() {
 		) * time.Second
 
 	// ------------------------------------------------------------
-	// Context / signals
-	// ------------------------------------------------------------
-
-	ctx, cancel := context.WithCancel(
-		context.Background(),
-	)
-	defer cancel()
-
-	sigCh := make(
-		chan os.Signal,
-		1,
-	)
-
-	signal.Notify(
-		sigCh,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT,
-		syscall.SIGHUP,
-	)
-
-	// ------------------------------------------------------------
 	// Routines
 	// ------------------------------------------------------------
 
-	restartDelay := 15 * time.Second
-
 	var routineWG sync.WaitGroup
 
-	startRoutines(
-		ctx,
-		conf.Routines,
-		tun,
-		restartDelay,
-		&routineWG,
-	)
+	for _, spawner := range conf.Routines {
+		if spawner == nil {
+			continue
+		}
+
+		routineWG.Add(1)
+
+		go func(
+			spawner wireproxyawg.RoutineSpawner,
+		) {
+			defer routineWG.Done()
+
+			runWithRestart(
+				ctx,
+				spawner,
+				tun,
+				15*time.Second,
+			)
+		}(spawner)
+	}
 
 	// ------------------------------------------------------------
 	// Ping
@@ -291,17 +442,29 @@ func main() {
 	tun.StartPingIPs()
 
 	// ------------------------------------------------------------
-	// HTTP servers
+	// pprof
 	// ------------------------------------------------------------
 
-	pprofServer := startPprofServer(
-		args.pprofAddr,
-	)
+	var pprofServer *http.Server
 
-	metricsServer := startMetricsServer(
-		args.info,
-		tun,
-	)
+	if *pprofAddr != "" {
+		pprofServer = startPprof(
+			*pprofAddr,
+		)
+	}
+
+	// ------------------------------------------------------------
+	// Metrics / health
+	// ------------------------------------------------------------
+
+	var metricsServer *http.Server
+
+	if *info != "" {
+		metricsServer = startMetrics(
+			*info,
+			tun,
+		)
+	}
 
 	// ------------------------------------------------------------
 	// Memory monitor
@@ -324,14 +487,17 @@ func main() {
 	// Signal handler
 	// ------------------------------------------------------------
 
-	startSignalHandler(
+	go handleSignals(
 		ctx,
 		cancel,
 		sigCh,
-		args.config,
-		reloadables,
+		*config,
 		tun,
+		reloadables,
 	)
+
+	// Keep runtime configuration explicit.
+	_ = runtime.GOMAXPROCS(0)
 
 	// ------------------------------------------------------------
 	// Wait
@@ -339,52 +505,22 @@ func main() {
 
 	<-ctx.Done()
 
-	slog.Info(
-		"Shutting down gracefully...",
-	)
+	// ------------------------------------------------------------
+	// Graceful shutdown
+	// ------------------------------------------------------------
 
-	shutdownCtx, shutdownCancel :=
-		context.WithTimeout(
-			context.Background(),
-			5*time.Second,
-		)
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
 	defer shutdownCancel()
 
-	// ------------------------------------------------------------
-	// Shutdown
-	// ------------------------------------------------------------
-
-	tun.StopPingIPs()
-
-	stopSocks5Routines(
+	gracefulShutdown(
+		shutdownCtx,
+		tun,
 		conf.Routines,
-	)
-
-	shutdownHTTPServer(
-		shutdownCtx,
-		metricsServer,
-		"metrics",
-	)
-
-	shutdownHTTPServer(
-		shutdownCtx,
-		pprofServer,
-		"pprof",
-	)
-
-	waitRoutines(
-		shutdownCtx,
 		&routineWG,
+		pprofServer,
+		metricsServer,
 	)
-
-	// WireGuard device is closed last.
-	if tun.Dev != nil {
-		tun.Dev.Close()
-	}
-
-	slog.Info(
-		"Shutdown complete",
-	)
-
-	_ = http.ErrServerClosed
 }

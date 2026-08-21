@@ -1,19 +1,16 @@
 package main
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"time"
 
-	wireproxyawg "github.com/ageich/wireproxy-awg"
-
 	_ "net/http/pprof"
+
+	wireproxyawg "github.com/ageich/wireproxy-awg"
 )
 
-func startPprofServer(
-	addr string,
-) *http.Server {
+func startPprof(addr string) *http.Server {
 	if addr == "" {
 		return nil
 	}
@@ -50,17 +47,16 @@ func startPprofServer(
 	return server
 }
 
-func startMetricsServer(
+func startMetrics(
 	addr string,
 	tun *wireproxyawg.VirtualTun,
 ) *http.Server {
-	if addr == "" {
+	if addr == "" || tun == nil {
 		return nil
 	}
 
 	server := &http.Server{
-		Addr: addr,
-
+		Addr:    addr,
 		Handler: tun,
 
 		ReadHeaderTimeout: 5 * time.Second,
@@ -68,6 +64,12 @@ func startMetricsServer(
 	}
 
 	go func() {
+		slog.Info(
+			"Starting metrics server",
+			"addr",
+			addr,
+		)
+
 		err := server.ListenAndServe()
 
 		if err != nil &&
@@ -82,24 +84,4 @@ func startMetricsServer(
 	}()
 
 	return server
-}
-
-func shutdownHTTPServer(
-	ctx context.Context,
-	server *http.Server,
-	name string,
-) {
-	if server == nil {
-		return
-	}
-
-	if err := server.Shutdown(ctx); err != nil {
-		slog.Error(
-			"HTTP server shutdown error",
-			"server",
-			name,
-			"error",
-			err,
-		)
-	}
 }
