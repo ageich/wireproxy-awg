@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 )
 
 const daemonProcess = "daemon-process"
@@ -36,9 +35,7 @@ func startDaemon(
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true,
-	}
+	configureDaemonProcess(cmd)
 
 	if err := cmd.Start(); err != nil {
 		_ = devNull.Close()
